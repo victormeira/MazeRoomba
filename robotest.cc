@@ -17,13 +17,15 @@
 #define NUMTHREADS 4
 #define CLIFFMAX 100
 #define FULLSPEED 220
-#define TURNSPEED 105
+#define TURNSPEED 120
 #define RANGE 2
 #define SAMPLES 3
+#define WALLSAMPLES 50
+#define MIDINDEX 25
 #define OCTHRESH 1
 #define REVERSESPEED -200
 #define REVERSESLEEPTIME 350
-#define REVERSEDISTANCE -40
+#define REVERSEDISTANCE -15
 #define ROTATEANGLE 60
 
 
@@ -165,9 +167,9 @@ void* safetyThread(void* data){
 
 			robot_ptr->sendDriveCommand(TURNSPEED, Create::DRIVE_INPLACE_CLOCKWISE);
 			wallSignal = robot_ptr->wallSignal();
-			while ((sampleWall>0) || (wallSignal>0)){
+			while ((sampleWall>5) || (wallSignal>5)){
 			//while(1){
-				cout<<"STOPPING SIGNAL IS: "<<wallSignal<<endl;
+				//cout<<"STOPPING SIGNAL IS: "<<wallSignal<<endl;
 				sampleWall = wallSignal;
 				wallSignal = robot_ptr->wallSignal();
 			}
@@ -235,12 +237,17 @@ void* wallFollowThread(void* data){
 	bool bump_flag = false, in_range;
 	bool is_safe =false;
 	bool speed_is_set = false;
+	bool is_local_maxima = false;
 	Create* robot_ptr = (Create*)data;
 	auto end_time = std::chrono::system_clock::now();
 	auto max_time = std::chrono::system_clock::now();
 	auto turn_time = std::chrono::system_clock::now();
 
-	time_t t_max;
+	//Arrays to store wall signals & corresponding time
+	time_t time_array[WALLSAMPLES];
+	short signal_array[WALLSAMPLES] = {0};
+
+	time_t t_max, t_sample;
 	time_t t_end;
 	double diff_time;
 	long sleep_time;
@@ -265,10 +272,11 @@ void* wallFollowThread(void* data){
 
 
 		if (bump_flag){
-			//cout<<"GOT A BUMP FLAG"<<endl;
+			cout<<"GOT A BUMP FLAG" << "SAFE? "<<is_safe<<endl;
 			state = CALLIBRATE;
 		}
 		if (is_safe){
+			//cout<<"state is:"<<state<<endl;
 				////////////////////	STATES 	///////////////////////
 				if (state == DRIVE){
 						//check safety
@@ -286,6 +294,7 @@ void* wallFollowThread(void* data){
 							robot_mutex.lock();
 							robot_ptr->sendDriveCommand(FULLSPEED, Create::DRIVE_STRAIGHT);
 							robot_mutex.unlock();
+
 							speed_mutex.lock();
 							speed_set=true;
 							speed_mutex.unlock();
@@ -293,45 +302,114 @@ void* wallFollowThread(void* data){
 				}
 				else if (state == CALLIBRATE){
 						cout<<"Callibrating"<<endl;
-						//TURN UNTIL WE GET THE FIRST READING
+						memset(signal_array, 0,WALLSAMPLES );
+
 						robot_mutex.lock();
 						robot_ptr->sendDriveCommand(TURNSPEED, Create::DRIVE_INPLACE_COUNTERCLOCKWISE);
-						wallSignal = robot_ptr->wallSignal();
-						//robot_mutex.unlock();
-						cout<<"LOOKING FOR VALID WAL"<<endl;
-						while (wallSignal<4){
-							//robot_mutex.lock();
-							wallSignal = robot_ptr->wallSignal();
-							//robot_mutex.unlock();
-						}
-						//robot_mutex.lock();
 
-						//ROTATE UNTIL WE SEE NO MORE WALL SIGNAL
-						while (wallSignal >0){
-							//IF THIS SIGNAL IS GREATER THAN THE MAX,
-							if (wallSignal>max_wall_signal){
-								max_wall_signal = wallSignal;
-								//store the time we got this
-								//max_time = std::chrono::system_clock::now();
-								t_max = time(NULL);
-								cout<<"sensor: "<<max_wall_signal<<endl; ;
-							}
-							//robot_mutex.lock();
+						cout<< "Getting"<<is_local_maxima<<" "<<(signal_array[MIDINDEX]<3)<<" "<<( (!is_local_maxima) && (signal_array[MIDINDEX]<3) ) << endl;
+
+						//WHILE NO LOCAL MAXIMA
+						is_local_maxima = false;
+						while ( (!is_local_maxima) || (signal_array[MIDINDEX]<5) ){
+							cout<<"IN WHILE LOOP"<<endl;
+							//GET NEW WALL SIGNAL SAMPLE
 							wallSignal = robot_ptr->wallSignal();
-							//robot_mutex.unlock();
+							t_sample = time(NULL);
+
+
+
+							//ADD SAMPLE TO THE ARRAYS
+							for (size_t i =0; i<WALLSAMPLES-1; i++){
+								signal_array[i] = signal_array[i+1];
+							}
+							signal_array[WALLSAMPLES-1] = wallSignal;
+							for (size_t i =0; i<WALLSAMPLES-1; i++){
+								time_array[i] = time_array[i+1];
+							}
+							time_array[WALLSAMPLES-1] = t_sample;
+
+
+							//CHECK IF IT IS THE LOCAL MAXIMA
+							is_local_maxima = true;
+							//GREATER THAN THOSE BEFORE
+							for (size_t i =0; i<MIDINDEX; i++){
+								is_local_maxima = is_local_maxima && (signal_array[MIDINDEX] >= signal_array[i]);
+								//cout<<"i = "<<i<<" - "<<signal_array[i]<<endl;
+							}
+							//GREATER THAN THOSE AFTER
+							for (size_t i =MIDINDEX+1; i<WALLSAMPLES; i++){
+								is_local_maxima = is_local_maxima && (signal_array[MIDINDEX] > signal_array[i]);
+								///cout<<"i = "<<i<<" - "<<signal_array[i]<<endl;
+							}
+							this_thread::sleep_for(chrono::milliseconds(8));
+							// cout<< "IS LOCAL MAXIMA: "<<is_local_maxima<<endl;
+							// cout<< "MID INDEX: "<<(signal_array[MIDINDEX] <3)<<endl;
+							// cout<< "NEW SAMPLE IS "<<wallSignal<<" VS "<< signal_array[WALLSAMPLES-1]<<endl;
+							//
+							// cout<<"CHOSEN SAMPLES:"<<endl;
+							// for (size_t i =0; i<WALLSAMPLES; i++){
+							// 	cout<<"i "<<i<<" VALUE:"<<signal_array[i]<< endl;
+							// }
+							// cout<< "........................................"<<endl;
+
+
 						}
-						//robot_mutex.lock();
+
+						cout<<"CHOSEN SAMPLES:"<<endl;
+						for (size_t i =0; i<WALLSAMPLES; i++){
+							cout<<"i "<<i<<" VALUE:"<<signal_array[i]<< endl;
+						}
+
 						robot_ptr->sendDriveCommand(0, Create::DRIVE_STRAIGHT);
 						t_end = time(NULL);
+						t_max = time_array[MIDINDEX];
 						robot_mutex.unlock();
-						//end_time = std::chrono::system_clock::now();
-						//std::chrono::duration<double> turn_time = end_time - max_time;
-						//t_end = time(NULL);
+
+						max_wall_signal = signal_array[MIDINDEX];
+
+						//TURN TO THE TIME FOR THE LOCAL MAXIMA
+
+
+
+
+
+						//TURN UNTIL WE GET THE FIRST READING
+						// robot_mutex.lock();
+						// robot_ptr->sendDriveCommand(TURNSPEED, Create::DRIVE_INPLACE_COUNTERCLOCKWISE);
+						// wallSignal = robot_ptr->wallSignal();
+						// //robot_mutex.unlock();
+						// cout<<"LOOKING FOR VALID WAL"<<endl;
+						// while (wallSignal<4){
+						// 	//robot_mutex.lock();
+						// 	wallSignal = robot_ptr->wallSignal();
+						// 	//robot_mutex.unlock();
+						// }
+						// //robot_mutex.lock();
+						//
+						// //ROTATE UNTIL WE SEE NO MORE WALL SIGNAL
+						// while (wallSignal >0){
+						// 	//IF THIS SIGNAL IS GREATER THAN THE MAX,
+						// 	if (wallSignal>max_wall_signal){
+						// 		max_wall_signal = wallSignal;
+						// 		//store the time we got this
+						// 		//max_time = std::chrono::system_clock::now();
+						// 		t_max = time(NULL);
+						// 		cout<<"sensor: "<<max_wall_signal<<endl; ;
+						// 	}
+						// 	//robot_mutex.lock();
+						// 	wallSignal = robot_ptr->wallSignal();
+						// 	//robot_mutex.unlock();
+						// }
+						// //robot_mutex.lock();
+						// robot_ptr->sendDriveCommand(0, Create::DRIVE_STRAIGHT);
+						// t_end = time(NULL);
+						// robot_mutex.unlock();
 
 
 
 						diff_time = difftime(t_end, t_max);
-						sleep_time = (diff_time*1000) - 200; //+ 200;
+						sleep_time = (diff_time*1000); //- 200; //+ 200;
 
 
 						cout<<"MaxSignal is: "<<max_wall_signal<<"Turn time in ms: "<<sleep_time<<endl;
@@ -346,42 +424,20 @@ void* wallFollowThread(void* data){
 
 						//robot_mutex.lock();
 						robot_ptr->sendDriveCommand(0, Create::DRIVE_STRAIGHT);
+						//wallSignal = robot_ptr->wallSignal();
+						cout<<"NEW WALL SIGNAL IS: "<<robot_ptr->wallSignal()<<endl;
+						//ROTATE TO THE MAX TIME
 						robot_mutex.unlock();
 
-
-						while(1){
-
-							robot_mutex.lock();
-							wallSignal = robot_ptr->wallSignal();
-							robot_mutex.unlock();
-							cout<<"Wall signal is: "<<wallSignal<<endl;
-
-						}
-						//STOP WHEN WE GET NO READING
+						state = DRIVE;
+						speed_mutex.lock();
+						speed_set = false;
+						speed_mutex.unlock();
+						bump_mutex.lock();
+						_bumped = false;
+						bump_mutex.unlock();
 
 
-
-
-
-						//Get wall Sensor & rotate
-						robot_mutex.lock();
-						robot_ptr->sendDriveCommand(TURNSPEED, Create::DRIVE_INPLACE_CLOCKWISE);
-						robot_ptr->sendWaitAngleCommand(ROTATEANGLE);
-						robot_mutex.unlock();
-						//this_thread::sleep_for(chrono::milliseconds(10000));
-						cout<< "TOLD IT TO TURN............................"<<endl;
-
-						while (1){
-							robot_mutex.lock();
-							//robot_ptr->sendDriveCommand(TURNSPEED, Create::DRIVE_INPLACE_CLOCKWISE);
-							//robot_ptr->sendWaitAngleCommand(ROTATEANGLE);
-							angle = robot_ptr->angle();
-							//robot_ptr->sendDriveCommand(0, Create::DRIVE_INPLACE_CLOCKWISE);
-							wallSignal = robot_ptr->wallSignal();
-							robot_mutex.unlock();
-							cout<<"wallSignal is:"<<wallSignal<<" angle is"<<angle<<endl;
-							//this_thread::sleep_for(chrono::milliseconds(10000));
-						}
 				}
 		}
 	}
