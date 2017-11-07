@@ -23,32 +23,20 @@ using namespace cv::xfeatures2d;
 #define OFF 0
 #define NUMTHREADS 4
 #define CLIFFMAX 100
+#define FULLSPEED 177
+#define TURNSPEED 120
 #define RANGE 2
 #define SAMPLES 3
 #define WALLSAMPLES 100
 #define MIDINDEX 50
 #define OCTHRESH 1
-
+#define REVERSESPEED -220
+#define REVERSESLEEPTIME 350
+#define REVERSEDISTANCE -15
+#define ROTATEANGLE 60
 #define RIGHTWHEELSPEED 170
 #define LEFTWHEELSPEED 30
 #define ADJUST_SAMPLES 15
-
-//PERIODS FOR EACH PRIORITY IN MS
-#define PRIORITY_1_PERIOD 50
-#define PRIORITY_2_PERIOD 150
-
-
-//ROBOT SPEEDS
-#define FULLSPEED 150
-#define TURNSPEED 150
-#define REVERSESPEED -200
-
-
-//WALL SIGNAL
-#define WALL_SIGNAL_SAMPLES 5
-#define SWEEP_SAMPLE_SIZE 150
-#define SAFETY_MARGIN 60
-
 
 
 using namespace iRobot;
@@ -80,10 +68,6 @@ enum states {DRIVE, CALLIBRATE, LEFT_ADJUST, RIGHT_ADJUST, HARD_RIGHT};
 
 
 
-//FUNCTION PROTOTYPES
-void wall_alignment (Create* robot_ptr);
-
-
 bool alignPerspective(vector<Point2f>& query, vector<Point2f>& scene, Mat& img_query, Mat& img_scene, vector<Point2f>& scene_corners);
 void cropBottom(Mat& img_scene_full, Mat& img_scene, float crop_fraction);
 void drawProjection(Mat& img_matches, Mat& img_query, vector<Point2f>& scene_corners);
@@ -97,31 +81,16 @@ map<string, Mat> detect_object(map<string, Mat> img_querys, Mat img_scene_full) 
 void* safetyThread(void* data){
 	//Local variables
 	short cL, cR, cFL, cFR, sum_oR, sum_oL;
-	bool wL, wR, wC, oR, oL, bump_flag = false;
+	bool wL, wR, wC, oR, oL, set = false, bump_flag = false;
 	bool or_arr[SAMPLES] = {0};
 	bool ol_arr[SAMPLES] = {0};
-	vector<bool> ol_vector, or_vector;
 	Create* robot_ptr = (Create*)data;
-	short wallSignal;
-	size_t i;
-	int lock_status;
-	double sleep_time_ms;
+	short sampleWall = 1, wallSignal;
 
-	//debugging
-	size_t max_c =0;
 
-//ALWAYS RUNNING TASK
 	while (1){
 		//cout<< "In safety thread"<<endl;
-		//STORE THE START TIME OF THE THREAD
-		//auto t_start = std::chrono::system_clock::now();
-		//GE THE LOCK OR SLEEP
-		while (!robot_mutex.try_lock()){
-			this_thread::sleep_for(chrono::milliseconds(PRIORITY_1_PERIOD));
-		}
-		auto t_start = std::chrono::system_clock::now();
-		//cout<<"GOT LOCK"<<endl;
-		//robot_mutex.lock();
+		robot_mutex.lock();
 		//looks for cliff signal, wheel drop & wheel overcurrent
 		cL = robot_ptr->cliffLeftSignal();
 		cR = robot_ptr->cliffRightSignal();
@@ -131,31 +100,19 @@ void* safetyThread(void* data){
 		wL = robot_ptr->wheeldropLeft();
 		wR = robot_ptr->wheeldropRight();
 		wC = robot_ptr->wheeldropCaster();
-		//wheel overcurrent: TAKE A FEW SAMPLES
-		ol_vector.push_back(robot_ptr->leftWheelOvercurrent());
-		or_vector.push_back(robot_ptr->rightWheelOvercurrent());
+		//wheel overcurrent
+		oR = robot_ptr->leftWheelOvercurrent();
+		oL = robot_ptr->rightWheelOvercurrent();
 		//bump sensors
 		bump_flag = robot_ptr->bumpLeft () || robot_ptr->bumpRight ();
 
 		//CHECK IF PLAY BUTTON PRESSED
 		if(robot_ptr->playButton())
 			done = true;
-		//robot_mutex.unlock();
+		robot_mutex.unlock();
 
 
-		if (ol_vector.size() > SAMPLES)
-			ol_vector.erase(ol_vector.begin());
-		if (or_vector.size() > SAMPLES)
-			or_vector.erase(or_vector.begin());
-
-		//GET AVG OVERCURRENT SIGNALS
-		sum_oL =0;	sum_oR =0;
-		for (i =0; i<SAMPLES; i++){
-			sum_oR += or_vector[i];
-			sum_oL += ol_vector[i];
-		}
-
-		if( (cL<CLIFFMAX)||(cR<CLIFFMAX)|| (cFL<CLIFFMAX)||(cFR<CLIFFMAX) || wL||wR||wC || (sum_oR>OCTHRESH) || (sum_oL>OCTHRESH) || (bump_flag) ){
+		while( (cL<CLIFFMAX)||(cR<CLIFFMAX)|| (cFL<CLIFFMAX)||(cFR<CLIFFMAX) || wL||wR||wC || (sum_oR>OCTHRESH) || (sum_oL>OCTHRESH) ){
 			cout<<"NOT SAFE"<<endl;
 			//STOP DRIVING & PLAY SONG & Set safety flag
 			safety_mutex.lock();
@@ -163,350 +120,153 @@ void* safetyThread(void* data){
 			safety_mutex.unlock();
 
 			//STOP THE ROBOT & PLAY SONG
-			//robot_mutex.lock();
-
-			if (bump_flag){
-				cout<<"BUMP DETECTED"<<endl;
-				robot_ptr->sendDriveCommand(REVERSESPEED, Create::DRIVE_STRAIGHT);
-				this_thread::sleep_for(chrono::milliseconds(30));
-				robot_ptr->sendDriveCommand(0, Create::DRIVE_STRAIGHT);
-				_bumped = true;
-
-			}
-			else{		//PLAY SONG IF IT WAS ANYTHING BUT A BUMP
-
-				robot_ptr->sendDriveCommand(0, Create::DRIVE_STRAIGHT);
-				//robot_ptr->sendPlaySongCommand((unsigned char)0);
-
-			}
+			robot_mutex.lock();
+			robot_ptr->sendDriveCommand(0, Create::DRIVE_STRAIGHT);
+			robot_ptr->sendPlaySongCommand((unsigned char)0);
 
 
 
-
-			//robot_mutex.unlock();
+			//Get new signal values
+			cL = robot_ptr->cliffLeftSignal();
+			cR = robot_ptr->cliffRightSignal();
+			cFL = robot_ptr->cliffFrontLeftSignal();
+			cFR = robot_ptr->cliffFrontRightSignal();
+			//Wheel drop
+			wL = robot_ptr->wheeldropLeft();
+			wR = robot_ptr->wheeldropRight();
+			wC = robot_ptr->wheeldropCaster();
+			//wheel overcurrent
+			oR = robot_ptr->leftWheelOvercurrent();
+			oL = robot_ptr->rightWheelOvercurrent();
+			robot_mutex.unlock();
 
 
 			//TELL ROBOT THAT IT HAS TO SET SPEED AGAIN
 			speed_mutex.lock();
 			speed_set = false;
 			speed_mutex.unlock();
-			// cout << "NEW WAVE.........." << endl;
-			// cout<< "cliff signals: "<<cL<<" "<<cR<<" "<<cFL<<" "<<cFR<<endl;
-			// cout<< "wheel drop signals: "<<wL<<" "<<wR<<" "<<wC<<endl;
-			// cout<< "Overcurrent signals: "<<oL<<" "<<oR<<" "<<sum_oL<<" "<<sum_oR<<endl;
-			// cout << "bump flags:"<<bump_flag<<endl;
-			// cout << "..................." << endl;
-		}
-		else{
-			//TELL THE ROBOT THAT IT IS SAFE TO MOVE
-			safety_mutex.lock();
-			if (!safe_flag){
-				safe_flag = true;
-				cout<<"IT IS NOW SAFE"<<endl;
+
+
+			//store & average overcurrent signals
+			//move all the signals down by one
+			sum_oL =0;
+			sum_oR =0;
+			for (int i=1; i<SAMPLES; i++){
+				//right side
+				or_arr[i] = or_arr[i-1];
+				sum_oR += or_arr[i];
+				//left side
+				ol_arr[i] = ol_arr[i-1];
+				sum_oL += ol_arr[i];
 			}
+			//store new signals
+			or_arr[0] = oR;
+			ol_arr[0]= oL;
+			//finish sum
+			sum_oR +=or_arr[0];
+			sum_oL +=ol_arr[0];
+
+			//cout << "NEW WAVE.........." << endl;
+			//cout<< "cliff signals: "<<cL<<" "<<cR<<" "<<cFL<<" "<<cFR<<endl;
+			//cout<< "wheel drop signals: "<<wL<<" "<<wR<<" "<<wC<<endl;
+			//cout<< "Overcurrent signals: "<<oL<<" "<<oR<<" "<<sum_oL<<" "<<sum_oR<<endl;
+			//cout << "bump flags:"<<bump_flag<<endl;
+			//cout << "..................." << endl;
+		}
+
+		//If it bumped into something, stop, reverse then stop again
+		if (bump_flag){
+			//its not safe
+			safety_mutex.lock();
+			safe_flag =false;
 			safety_mutex.unlock();
-		}
-		//release the lock
-		robot_mutex.unlock();
 
-		//Store the end time of the thread
-		auto t_end = std::chrono::system_clock::now();
+			//this_thread::sleep_for(chrono::milliseconds(10));
 
+			//let the stream clear
+			//robot_mutex.lock();
+			//robot_ptr->sendDriveCommand(0, Create::DRIVE_STRAIGHT);
+			//robot_mutex.unlock();
 
-		//COMPUTE SLEEP TIME
-		auto time_diff_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start);
-		sleep_time_ms = PRIORITY_1_PERIOD - time_diff_ms.count();
+			//reverse for a few secs
+			cout<<"BUMP! REVERSING!"<<endl;
 
-		if (time_diff_ms.count() > max_c){
-			max_c = time_diff_ms.count();
-			cout<< "SAFETY DIFF TIME: "<<time_diff_ms.count()<<endl;
-			cout<< "SAFETY SLEEP TIME: "<<sleep_time_ms<<endl;
-		}
+			//ROTATE UNTIL SENSOR READING IS ZERO
+			//reverse
+			robot_mutex.lock();
 
-		//Sleep to complete period
-		if (time_diff_ms.count() > 0)
-			this_thread::sleep_for(chrono::milliseconds((long)sleep_time_ms));
-		else
-			this_thread::sleep_for(chrono::milliseconds((long)sleep_time_ms));
-	}
-}
+			//TURN A LITTLE
+			robot_ptr->sendDriveCommand(TURNSPEED, Create::DRIVE_INPLACE_CLOCKWISE);
+			this_thread::sleep_for(chrono::milliseconds(300));
+			robot_ptr->sendDriveCommand(REVERSESPEED, Create::DRIVE_STRAIGHT);
+			this_thread::sleep_for(chrono::milliseconds(170));
 
 
+			//robot_ptr->sendDriveCommand(TURNSPEED, Create::DRIVE_INPLACE_CLOCKWISE);
+			wallSignal = robot_ptr->wallSignal();
+			// while ((sampleWall>5) || (wallSignal>5)){
+			// //while(1){
+			// 	//cout<<"STOPPING SIGNAL IS: "<<wallSignal<<endl;
+			// 	sampleWall = wallSignal;
+			// 	wallSignal = robot_ptr->wallSignal();
+			// }
+			//this_thread::sleep_for(chrono::milliseconds(180));
+			cout<<"STOPPING SIGNAL IS: "<<robot_ptr->wallSignal()<<endl;
+			//robot_ptr->sendDriveCommand(0, Create::DRIVE_STRAIGHT);
+			//robot_ptr->sendDriveCommand(REVERSESPEED, Create::DRIVE_STRAIGHT);
+			//robot_ptr->sendWaitDistanceCommand(REVERSEDISTANCE);
+			//robot_mutex.unlock();
+
+			//this_thread::sleep_for(chrono::milliseconds(50));
 
 
+			//wait until bump sensor is clear
+			while (bump_flag){
+				//robot_mutex.lock();
+				bump_flag = robot_ptr->bumpLeft () || robot_ptr->bumpRight ();
+				//robot_mutex.unlock();
+			}
+
+			//stop the robot
+			//robot_mutex.lock();
+			robot_ptr->sendDriveCommand(0, Create::DRIVE_STRAIGHT);
 
 
+			//debugging
+			//this_thread::sleep_for(chrono::milliseconds(2000));
 
-//THREAD THAT IS RESPONSIBLE FOR NAVIGATING THE ROBOT AROUND THE MAZE
-void* navigationThread(void* data){
-	//LOCAL VARIABLES
-	size_t i;
-	int tilt_sum, signal_diff;
-	//wall signal stuff
-	short wallSignal;
-	vector <short> wallSignal_vector;
-	wallSignal_vector.reserve(WALL_SIGNAL_SAMPLES);		//reserve enough space
-	short vector_size;
-	//flags
-	bool is_safe, has_bumped, has_set_speed, lost_wall, aligned = false;
-	//Timing
-	double sleep_time_ms;
-	Create* robot_ptr = (Create*)data;
+			// robot_mutex.unlock();
+			//
+			//
+			// robot_mutex.lock();
+			bump_flag = robot_ptr->bumpLeft () || robot_ptr->bumpRight ();
+			robot_mutex.unlock();
 
+			cout<<"Bump sensor is now:"<<bump_flag<<endl;
 
-	//ALWAYS EXECUTING TASK
-	while(1){
-		//Get start time
-		auto t_start = std::chrono::system_clock::now();
+			//tell wall follow thread to callibrate sensors
+			bump_mutex.lock();
+			_bumped = true;
+			bump_mutex.unlock();
 
-		//POLL THE WALL SIGNALS, SAFETY FLAG, BUMPED FLAG, SET SPEED FLAGS
-		safety_mutex.lock();
-		is_safe = safe_flag;
-		safety_mutex.unlock();
-
-		bump_mutex.lock();
-		has_bumped = _bumped;
-		bump_mutex.unlock();
-
-		speed_mutex.lock();
-		has_set_speed = speed_set;
-		speed_mutex.unlock();
-
-
-		robot_mutex.lock();
-		//SET THE SPEED TO MOVE FORWARD IF IT HAS NOT ALREADY BEEN SET
-		if (!has_set_speed && !has_bumped){
-			robot_ptr->sendDriveCommand(FULLSPEED, Create::DRIVE_STRAIGHT);
-			cout<< "SETTING SPEED"<<endl;
+			//TELL ROBOT THAT IT HAS TO SET SPEED AGAIN
 			speed_mutex.lock();
-			speed_set=true;
+			speed_set = false;
 			speed_mutex.unlock();
 		}
-		//ADD NEW WALL SIGNAL TO THE BUFFER
-		wallSignal_vector.push_back( robot_ptr->wallSignal());
-		robot_mutex.unlock();
 
-
-
-		//make sure vector remains the right size
-		if (wallSignal_vector.size() > WALL_SIGNAL_SAMPLES ){
-			//DELETE OLDEST ENTRY
-			wallSignal_vector.erase(wallSignal_vector.begin());
+		//set the flag if needed
+		safety_mutex.lock();
+		if (!safe_flag){
+			safe_flag = true;
+			cout<<"IT IS NOW SAFE"<<endl;
 		}
-		//update vector size
-		vector_size = wallSignal_vector.size();
-
-		cout<< "VECTOR SIZE: "<<vector_size<< endl;
-
-		robot_mutex.lock();
-		//CHECK FOR ANY EVENTS
-		if ( (vector_size == WALL_SIGNAL_SAMPLES) && (!has_bumped) && (aligned) ){		//taken enough samples & not a bump event
-			cout<< "Checking walls....."<<endl;
-			//Check for lost wall signal
-			lost_wall = true;
-			cout<< "WALL SIGNAL WAS: ";
-			for (i = 1; i<4; i++){
-				lost_wall = lost_wall &&  (wallSignal_vector[vector_size - i] ==0) ;
-				cout<< wallSignal_vector[vector_size -i]<< " ";
-			}
-			cout<<endl;
-			size_t array_sum =0;
-			//check for left/right sway
-			tilt_sum =0;
-			for (i=0; i<vector_size-1; i++){
-				signal_diff = wallSignal_vector[i+1] - wallSignal_vector[i];
-				//ADD IF INCREASE SUBTRACT IF DECREASE
-				if (signal_diff>0){
-					tilt_sum++;
-					if (signal_diff > 5)
-						tilt_sum +5;
-				}
-				else if (signal_diff<0){
-					tilt_sum--;
-					if (signal_diff < -5)
-						tilt_sum -5;
-				}
-				array_sum= wallSignal_vector[i];
-			}
-			cout<< "TILT SUM: "<<tilt_sum<<endl;
-
-
-
-			//ACTIONS FOR ANY OF THE EVENTS
-			if(lost_wall){
-				cout<< "LOST WALL...ADJUSTING"<<endl;
-				//DRIVE FORWARD A LITTLE (250mm)
-				this_thread::sleep_for(chrono::milliseconds(200));
-				robot_ptr->sendDriveCommand(0, Create::DRIVE_INPLACE_CLOCKWISE);
-				//this_thread::sleep_for(chrono::milliseconds(3000));
-
-				if (robot_ptr->wallSignal() == 0){
-					//ROTATE 100 DEGREES CLOCKWISE
-					robot_ptr->sendDriveCommand(TURNSPEED, Create::DRIVE_INPLACE_CLOCKWISE);
-					this_thread::sleep_for(chrono::milliseconds(1700));
-					//CONTINUE DRIVING STRAIGHT
-					robot_ptr->sendDriveCommand(FULLSPEED, Create::DRIVE_STRAIGHT);
-					// //CLEAR THE SAMPLES
-					wallSignal_vector.clear();
-				}
-				else{
-					cout<< "FALSE ALARM"<<endl;
-					//CONTINUE DRIVING STRAIGHT
-					robot_ptr->sendDriveCommand(FULLSPEED, Create::DRIVE_STRAIGHT);
-				}
-
-			}
-			else if (tilt_sum > 0){
-				cout<< " ADJUSTING TO THE LEFT "<<endl;
-				//ROTATE A FEW DEGREES COUNTERCLOCKWISE
-				//robot_ptr->sendDriveCommand(TURNSPEED, Create::DRIVE_INPLACE_COUNTERCLOCKWISE);
-				robot_ptr->sendDriveDirectCommand( 90, 170);
-				this_thread::sleep_for(chrono::milliseconds(500));
-				//CONTINUE DRIVING STRAIGHT
-				robot_ptr->sendDriveCommand(FULLSPEED, Create::DRIVE_STRAIGHT);
-				// //CLEAR THE SAMPLES
-				wallSignal_vector.clear();
-
-			}
-			else if (tilt_sum < 0){
-				cout<< " ADJUSTING TO THE RIGHT "<<endl;
-				//ROTATE A FEW DEGREES CLOCKWISEA
-				//robot_ptr->sendDriveCommand(TURNSPEED, Create::DRIVE_INPLACE_CLOCKWISE);
-				robot_ptr->sendDriveDirectCommand( 170, 90);
-				this_thread::sleep_for(chrono::milliseconds(500));
-				//CONTINUE DRIVING STRAIGHT
-				robot_ptr->sendDriveCommand(FULLSPEED, Create::DRIVE_STRAIGHT);
-				// //CLEAR THE SAMPLES
-				wallSignal_vector.clear();
-			}
-		}
-		robot_mutex.unlock();
-
-		//IF A BUMP HAPPENED: REALIGN
-		if (has_bumped){
-			cout<< "BUMP IN NAV"<<endl;
-			robot_mutex.lock();
-			wall_alignment(robot_ptr);
-			robot_mutex.unlock();
-			bump_mutex.lock();
-			_bumped = false;
-			bump_mutex.unlock();
-			aligned = true;
-
-		}
-
-
-		//COMPUTE SLEEP TIME & SLEEP
-		auto t_end = std::chrono::system_clock::now();
-		auto time_diff_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start);
-		sleep_time_ms = PRIORITY_2_PERIOD - time_diff_ms.count();
-		//cout<< "NAVIGATION DIFF TIME: "<<time_diff_ms.count()<<endl;
-		//cout<< " NAVIGATION SLEEP TIME: "<<sleep_time_ms<<endl;
-		//Sleep to complete period
-		if (sleep_time_ms > 0)
-			this_thread::sleep_for(chrono::milliseconds((long)sleep_time_ms));
-		else {
-			this_thread::sleep_for(chrono::milliseconds(PRIORITY_2_PERIOD));
-			cout<<"SPENT TOO LONG: "<<time_diff_ms.count()<<endl;
-		}
-
+		safety_mutex.unlock();
 	}
 
+	//this_thread::sleep_for(chrono::milliseconds(10));
+
 }
-
-
-
-//FUNCTION THAT ALIGNS THE ROBOT WITH THE WALL
-/*
-*	ALGORITHM: SWEEP THROUGH CLOCKWISE UNTIL A DECREASE IS SEEN
-*			   ROTATE BACK BY HOW LONG IT TOOK TO GET  HERE
-*
-*
-*/
-void wall_alignment (Create* robot_ptr){
-
-	//LOCAL VARIABLES
-	short wallSignal, size;
-	vector<short> signal_vector;
-	vector <std::chrono::milliseconds> time_vector;
-	uint32_t index = SWEEP_SAMPLE_SIZE - SAFETY_MARGIN;
-
-
-	cout<< "IN ALIGNMENT THREAD"<< endl;
-
-	//MOVE CLOCKWISE A LITTLE
-	robot_ptr->sendDriveCommand(TURNSPEED, Create::DRIVE_INPLACE_CLOCKWISE);
-	//robot_mutex.unlock();
-	this_thread::sleep_for(chrono::milliseconds(600));
-	//REVERSE A LITTLE
-	robot_ptr->sendDriveCommand(REVERSESPEED, Create::DRIVE_STRAIGHT);
-	this_thread::sleep_for(chrono::milliseconds(15));
-
-	robot_ptr->sendDriveCommand(TURNSPEED, Create::DRIVE_INPLACE_COUNTERCLOCKWISE);
-	//FIND THE LOCAL MAXIMA
-	while (1){
-		//robot_mutex.lock();
-		//robot_ptr->sendDriveCommand(TURNSPEED, Create::DRIVE_INPLACE_COUNTERCLOCKWISE);
-
-		//cout<< "TRYING TO ALIGN"<<endl;
-
-		//SAMPLE WALL SIGNAL & store time of wall signal
-		wallSignal = robot_ptr->wallSignal();
-		signal_vector.push_back(wallSignal);
-		size = signal_vector.size();
-		//cout<< "NEW WALL SIGNAL: "<< wallSignal<<" SAMPLE SIZE: "<<endl;
-		//time_vector.push_back(std::chrono::system_clock::now());
-
-		//KEEP SIZE THE SAME
-		if (size > SWEEP_SAMPLE_SIZE){
-			//cout <<"CULLING SIZE BY ONE: "<<signal_vector.size()<<endl;
-			signal_vector.erase(signal_vector.begin());
-			//cout<< "NEW SIZE IS: "<<signal_vector.size()<<endl;
-			size = signal_vector.size();
-		}
-
-
-		//IF ENOUGH SAMPLES
-		if (size== SWEEP_SAMPLE_SIZE){
-			//cout<< "vector size: "<< signal_vector.size()<<" INDEX IS:"<<index<<endl;
-			//CHECK FOR A LOCAL MAXIMA
-			auto it = max_element(signal_vector.begin(), signal_vector.end());
-			//cout<< "MAX VALUE IS :" <<*it<<endl;
-			if ( (signal_vector[index] == *it)  && (signal_vector[index] > 30) && (signal_vector[index] > signal_vector[SWEEP_SAMPLE_SIZE-1]) ){
-			//if ( (signal_vector[index] > 40) ){
-				cout<< "GOING THE OTHER WAY"<<endl;
-				//robot_ptr->sendDriveCommand(0, Create::DRIVE_INPLACE_CLOCKWISE);
-				cout<< "MAXIMA IS: "<< signal_vector[index];
-				//this_thread::sleep_for(chrono::milliseconds(10000));
-				//cout<< "MAXIMA IS: "<< signal_vector[index];
-				//ROTATE BACK TO MAXIMA
-				robot_ptr->sendDriveCommand(TURNSPEED, Create::DRIVE_INPLACE_CLOCKWISE);
-				//robot_mutex.unlock();
-				this_thread::sleep_for(chrono::milliseconds(600));
-				//robot_mutex.lock();
-				//CONTINUE DRIVING STRAIGHT
-				robot_ptr->sendDriveCommand(FULLSPEED, Create::DRIVE_STRAIGHT);
-
-				cout<< "PRINTING ARRAY"<<endl;
-				for (size_t i =0; i<size; i++){
-					cout<< signal_vector[i]<<endl;
-				}
-
-				robot_mutex.unlock();
-				//EXIT THE FUNCTION
-				break;
-			}
-		}
-		this_thread::sleep_for(chrono::milliseconds(10));
-		//robot_mutex.unlock();
-	}
-}
-
-
-
-
-
-
 
 
 
@@ -1143,8 +903,8 @@ int main ()
 
 	//CREATE THE THEADS
 	pthread_create(&thread_ids[0], &attrSafety, safetyThread,(void*)&robot);
-	pthread_create(&thread_ids[1], &attrMotion, navigationThread,(void*)&robot);
-	//pthread_create(&thread_ids[2], &attrMotion, mazePlotThread,(void*)&robot);
+	pthread_create(&thread_ids[1], &attrMotion, wallFollowThread,(void*)&robot);
+	pthread_create(&thread_ids[2], &attrMotion, mazePlotThread,(void*)&robot);
 	//pthread_create(&thread_ids[3], NULL, objectIdentificationThread,(void*)&robot);
 
 
