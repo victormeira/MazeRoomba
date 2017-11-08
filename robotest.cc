@@ -27,7 +27,7 @@ using namespace cv::xfeatures2d;
 #define SAMPLES 3
 #define WALLSAMPLES 100
 #define MIDINDEX 50
-#define OCTHRESH 1
+#define OCTHRESH 3
 
 #define RIGHTWHEELSPEED 170
 #define LEFTWHEELSPEED 30
@@ -35,7 +35,7 @@ using namespace cv::xfeatures2d;
 
 //PERIODS FOR EACH PRIORITY IN MS
 #define PRIORITY_1_PERIOD 50
-#define PRIORITY_2_PERIOD 150
+#define PRIORITY_2_PERIOD 100
 
 
 //ROBOT SPEEDS
@@ -45,7 +45,7 @@ using namespace cv::xfeatures2d;
 
 
 //WALL SIGNAL
-#define WALL_SIGNAL_SAMPLES 5
+#define WALL_SIGNAL_SAMPLES 3
 #define SWEEP_SAMPLE_SIZE 150
 #define SAFETY_MARGIN 60
 
@@ -62,6 +62,7 @@ mutex robot_mutex;
 mutex safety_mutex;
 mutex bump_mutex;
 mutex speed_mutex;
+mutex restart_mutex;
 
 
 //FLAGS
@@ -70,6 +71,7 @@ volatile bool speed_set = false;
 volatile bool _bumped = false;
 volatile bool done = false;
 volatile bool waypoint_change = false;
+volatile bool restart = true;
 
 
 //GLOBAL VARS
@@ -155,7 +157,7 @@ void* safetyThread(void* data){
 			sum_oL += ol_vector[i];
 		}
 
-		if( (cL<CLIFFMAX)||(cR<CLIFFMAX)|| (cFL<CLIFFMAX)||(cFR<CLIFFMAX) || wL||wR||wC || (sum_oR>OCTHRESH) || (sum_oL>OCTHRESH) || (bump_flag) ){
+		if( (cL<CLIFFMAX)||(cR<CLIFFMAX)|| (cFL<CLIFFMAX)||(cFR<CLIFFMAX) || wL||wR||wC || (sum_oR>=OCTHRESH) || (sum_oL>=OCTHRESH) || (bump_flag) ){
 			cout<<"NOT SAFE"<<endl;
 			//STOP DRIVING & PLAY SONG & Set safety flag
 			safety_mutex.lock();
@@ -176,7 +178,10 @@ void* safetyThread(void* data){
 			else{		//PLAY SONG IF IT WAS ANYTHING BUT A BUMP
 
 				robot_ptr->sendDriveCommand(0, Create::DRIVE_STRAIGHT);
-				//robot_ptr->sendPlaySongCommand((unsigned char)0);
+				restart = true;
+				speed_set = false;
+				_bumped = false;
+				robot_ptr->sendPlaySongCommand((unsigned char)0);
 
 			}
 
@@ -190,12 +195,12 @@ void* safetyThread(void* data){
 			speed_mutex.lock();
 			speed_set = false;
 			speed_mutex.unlock();
-			// cout << "NEW WAVE.........." << endl;
-			// cout<< "cliff signals: "<<cL<<" "<<cR<<" "<<cFL<<" "<<cFR<<endl;
-			// cout<< "wheel drop signals: "<<wL<<" "<<wR<<" "<<wC<<endl;
-			// cout<< "Overcurrent signals: "<<oL<<" "<<oR<<" "<<sum_oL<<" "<<sum_oR<<endl;
-			// cout << "bump flags:"<<bump_flag<<endl;
-			// cout << "..................." << endl;
+			cout << "NEW WAVE.........." << endl;
+			cout<< "cliff signals: "<<cL<<" "<<cR<<" "<<cFL<<" "<<cFR<<endl;
+			cout<< "wheel drop signals: "<<wL<<" "<<wR<<" "<<wC<<endl;
+			cout<< "Overcurrent signals: "<<oL<<" "<<oR<<" "<<sum_oL<<" "<<sum_oR<<endl;
+			cout << "bump flags:"<<bump_flag<<endl;
+			cout << "..................." << endl;
 		}
 		else{
 			//TELL THE ROBOT THAT IT IS SAFE TO MOVE
@@ -246,9 +251,9 @@ void* navigationThread(void* data){
 	short wallSignal;
 	vector <short> wallSignal_vector;
 	wallSignal_vector.reserve(WALL_SIGNAL_SAMPLES);		//reserve enough space
-	short vector_size;
+	short vector_size, lost_wall_count =0;
 	//flags
-	bool is_safe, has_bumped, has_set_speed, lost_wall, aligned = false;
+	bool is_safe, has_bumped, has_set_speed, lost_wall, aligned = false, to_restart;
 	//Timing
 	double sleep_time_ms;
 	Create* robot_ptr = (Create*)data;
@@ -273,6 +278,13 @@ void* navigationThread(void* data){
 		speed_mutex.unlock();
 
 
+
+		if (!is_safe){
+			this_thread::sleep_for(chrono::milliseconds(PRIORITY_2_PERIOD));
+			continue;
+		}
+
+
 		robot_mutex.lock();
 		//SET THE SPEED TO MOVE FORWARD IF IT HAS NOT ALREADY BEEN SET
 		if (!has_set_speed && !has_bumped){
@@ -280,7 +292,9 @@ void* navigationThread(void* data){
 			cout<< "SETTING SPEED"<<endl;
 			speed_mutex.lock();
 			speed_set=true;
+			aligned = false;
 			speed_mutex.unlock();
+			wallSignal_vector.clear();
 		}
 		//ADD NEW WALL SIGNAL TO THE BUFFER
 		wallSignal_vector.push_back( robot_ptr->wallSignal());
@@ -296,7 +310,7 @@ void* navigationThread(void* data){
 		//update vector size
 		vector_size = wallSignal_vector.size();
 
-		cout<< "VECTOR SIZE: "<<vector_size<< endl;
+		cout<< "VECTOR SIZE: "<<vector_size<<" BUMPED: "<< has_bumped<< " ALIGNED: "<<aligned<<endl;
 
 		robot_mutex.lock();
 		//CHECK FOR ANY EVENTS
@@ -306,48 +320,52 @@ void* navigationThread(void* data){
 			lost_wall = true;
 			cout<< "WALL SIGNAL WAS: ";
 			for (i = 1; i<4; i++){
-				lost_wall = lost_wall &&  (wallSignal_vector[vector_size - i] ==0) ;
+				lost_wall = lost_wall &&  (wallSignal_vector[vector_size - i] <2) ;
 				cout<< wallSignal_vector[vector_size -i]<< " ";
 			}
 			cout<<endl;
-			size_t array_sum =0;
+			if (lost_wall)
+				lost_wall_count++;
+
+			//size_t array_sum =0;
 			//check for left/right sway
 			tilt_sum =0;
-			for (i=0; i<vector_size-1; i++){
-				signal_diff = wallSignal_vector[i+1] - wallSignal_vector[i];
+			for (i=1; i<vector_size; i++){
+				signal_diff = wallSignal_vector[i] - wallSignal_vector[i-1];		//+ve is an increase in wall sig
 				//ADD IF INCREASE SUBTRACT IF DECREASE
 				if (signal_diff>0){
 					tilt_sum++;
 					if (signal_diff > 5)
-						tilt_sum +5;
+						tilt_sum +=5;
 				}
 				else if (signal_diff<0){
 					tilt_sum--;
 					if (signal_diff < -5)
-						tilt_sum -5;
+						tilt_sum -=5;
 				}
-				array_sum= wallSignal_vector[i];
+				//array_sum= wallSignal_vector[i];
 			}
 			cout<< "TILT SUM: "<<tilt_sum<<endl;
 
 
 
 			//ACTIONS FOR ANY OF THE EVENTS
-			if(lost_wall){
+			if(lost_wall_count > 24){
 				cout<< "LOST WALL...ADJUSTING"<<endl;
 				//DRIVE FORWARD A LITTLE (250mm)
-				this_thread::sleep_for(chrono::milliseconds(200));
-				robot_ptr->sendDriveCommand(0, Create::DRIVE_INPLACE_CLOCKWISE);
+				//this_thread::sleep_for(chrono::milliseconds(1850));
+				//robot_ptr->sendDriveCommand(0, Create::DRIVE_INPLACE_CLOCKWISE);
 				//this_thread::sleep_for(chrono::milliseconds(3000));
 
-				if (robot_ptr->wallSignal() == 0){
+				if (robot_ptr->wallSignal() <2){
 					//ROTATE 100 DEGREES CLOCKWISE
 					robot_ptr->sendDriveCommand(TURNSPEED, Create::DRIVE_INPLACE_CLOCKWISE);
-					this_thread::sleep_for(chrono::milliseconds(1700));
+					this_thread::sleep_for(chrono::milliseconds(1610));
 					//CONTINUE DRIVING STRAIGHT
 					robot_ptr->sendDriveCommand(FULLSPEED, Create::DRIVE_STRAIGHT);
 					// //CLEAR THE SAMPLES
 					wallSignal_vector.clear();
+					lost_wall_count =0;
 				}
 				else{
 					cout<< "FALSE ALARM"<<endl;
@@ -356,24 +374,24 @@ void* navigationThread(void* data){
 				}
 
 			}
-			else if (tilt_sum > 0){
+			else if (tilt_sum > 0){		//increasing wall signal values
 				cout<< " ADJUSTING TO THE LEFT "<<endl;
 				//ROTATE A FEW DEGREES COUNTERCLOCKWISE
 				//robot_ptr->sendDriveCommand(TURNSPEED, Create::DRIVE_INPLACE_COUNTERCLOCKWISE);
-				robot_ptr->sendDriveDirectCommand( 90, 170);
-				this_thread::sleep_for(chrono::milliseconds(500));
+				robot_ptr->sendDriveDirectCommand( 10, 250);
+				this_thread::sleep_for(chrono::milliseconds(115));
 				//CONTINUE DRIVING STRAIGHT
 				robot_ptr->sendDriveCommand(FULLSPEED, Create::DRIVE_STRAIGHT);
 				// //CLEAR THE SAMPLES
 				wallSignal_vector.clear();
 
 			}
-			else if (tilt_sum < 0){
+			else if (tilt_sum < 0){		//decreasing wall signal values
 				cout<< " ADJUSTING TO THE RIGHT "<<endl;
 				//ROTATE A FEW DEGREES CLOCKWISEA
 				//robot_ptr->sendDriveCommand(TURNSPEED, Create::DRIVE_INPLACE_CLOCKWISE);
-				robot_ptr->sendDriveDirectCommand( 170, 90);
-				this_thread::sleep_for(chrono::milliseconds(500));
+				robot_ptr->sendDriveDirectCommand( 250, 10);
+				this_thread::sleep_for(chrono::milliseconds(115));
 				//CONTINUE DRIVING STRAIGHT
 				robot_ptr->sendDriveCommand(FULLSPEED, Create::DRIVE_STRAIGHT);
 				// //CLEAR THE SAMPLES
@@ -392,6 +410,9 @@ void* navigationThread(void* data){
 			_bumped = false;
 			bump_mutex.unlock();
 			aligned = true;
+			speed_mutex.lock();
+			speed_set=true;
+			speed_mutex.unlock();
 
 		}
 
@@ -437,10 +458,10 @@ void wall_alignment (Create* robot_ptr){
 	//MOVE CLOCKWISE A LITTLE
 	robot_ptr->sendDriveCommand(TURNSPEED, Create::DRIVE_INPLACE_CLOCKWISE);
 	//robot_mutex.unlock();
-	this_thread::sleep_for(chrono::milliseconds(600));
+	this_thread::sleep_for(chrono::milliseconds(800));
 	//REVERSE A LITTLE
 	robot_ptr->sendDriveCommand(REVERSESPEED, Create::DRIVE_STRAIGHT);
-	this_thread::sleep_for(chrono::milliseconds(15));
+	this_thread::sleep_for(chrono::milliseconds(8));
 
 	robot_ptr->sendDriveCommand(TURNSPEED, Create::DRIVE_INPLACE_COUNTERCLOCKWISE);
 	//FIND THE LOCAL MAXIMA
@@ -472,7 +493,7 @@ void wall_alignment (Create* robot_ptr){
 			//CHECK FOR A LOCAL MAXIMA
 			auto it = max_element(signal_vector.begin(), signal_vector.end());
 			//cout<< "MAX VALUE IS :" <<*it<<endl;
-			if ( (signal_vector[index] == *it)  && (signal_vector[index] > 30) && (signal_vector[index] > signal_vector[SWEEP_SAMPLE_SIZE-1]) ){
+			if ( (signal_vector[index] == *it)  && (signal_vector[index] > 10) && (signal_vector[index] > signal_vector[SWEEP_SAMPLE_SIZE-1]) ){
 			//if ( (signal_vector[index] > 40) ){
 				cout<< "GOING THE OTHER WAY"<<endl;
 				//robot_ptr->sendDriveCommand(0, Create::DRIVE_INPLACE_CLOCKWISE);
@@ -482,7 +503,7 @@ void wall_alignment (Create* robot_ptr){
 				//ROTATE BACK TO MAXIMA
 				robot_ptr->sendDriveCommand(TURNSPEED, Create::DRIVE_INPLACE_CLOCKWISE);
 				//robot_mutex.unlock();
-				this_thread::sleep_for(chrono::milliseconds(600));
+				this_thread::sleep_for(chrono::milliseconds(630));
 				//robot_mutex.lock();
 				//CONTINUE DRIVING STRAIGHT
 				robot_ptr->sendDriveCommand(FULLSPEED, Create::DRIVE_STRAIGHT);
