@@ -27,7 +27,7 @@ using namespace cv::xfeatures2d;
 #define SAMPLES 3
 #define WALLSAMPLES 100
 #define MIDINDEX 50
-#define OCTHRESH 1
+#define OCTHRESH 3
 
 #define RIGHTWHEELSPEED 170
 #define LEFTWHEELSPEED 30
@@ -35,7 +35,8 @@ using namespace cv::xfeatures2d;
 
 //PERIODS FOR EACH PRIORITY IN MS
 #define PRIORITY_1_PERIOD 50
-#define PRIORITY_2_PERIOD 150
+#define PRIORITY_2_PERIOD 100
+#define PRIORITY_3_PERIOD 5000
 
 
 //ROBOT SPEEDS
@@ -45,7 +46,7 @@ using namespace cv::xfeatures2d;
 
 
 //WALL SIGNAL
-#define WALL_SIGNAL_SAMPLES 5
+#define WALL_SIGNAL_SAMPLES 3
 #define SWEEP_SAMPLE_SIZE 150
 #define SAFETY_MARGIN 60
 
@@ -62,6 +63,7 @@ mutex robot_mutex;
 mutex safety_mutex;
 mutex bump_mutex;
 mutex speed_mutex;
+mutex restart_mutex;
 
 
 //FLAGS
@@ -70,14 +72,24 @@ volatile bool speed_set = false;
 volatile bool _bumped = false;
 volatile bool done = false;
 volatile bool waypoint_change = false;
+volatile bool restart = true;
 
 
 //GLOBAL VARS
 volatile short rot_angle;
+vector <cv::Mat> image_vect;
 
 
 enum states {DRIVE, CALLIBRATE, LEFT_ADJUST, RIGHT_ADJUST, HARD_RIGHT};
 
+
+
+typedef struct objectInput{
+	map<string, vector<KeyPoint>>*  keypoints_query_map_ptr;
+	map<string, Mat>* descriptors_query_map_ptr;
+	map<string, Mat>* queryImages_ptr;
+	Create * robot_ptr;
+}objectInput;
 
 
 //FUNCTION PROTOTYPES
@@ -89,7 +101,7 @@ void cropBottom(Mat& img_scene_full, Mat& img_scene, float crop_fraction);
 void drawProjection(Mat& img_matches, Mat& img_query, vector<Point2f>& scene_corners);
 string type2str(int type);
 void usage();
-map<string, Mat> detect_object(map<string, Mat> img_querys, Mat img_scene_full) ;
+map<string, Mat> detect_object(map<string, Mat>& img_querys, Mat &img_scene_full, objectInput data_str, bool* found_lamp) ;
 
 
 
@@ -155,7 +167,7 @@ void* safetyThread(void* data){
 			sum_oL += ol_vector[i];
 		}
 
-		if( (cL<CLIFFMAX)||(cR<CLIFFMAX)|| (cFL<CLIFFMAX)||(cFR<CLIFFMAX) || wL||wR||wC || (sum_oR>OCTHRESH) || (sum_oL>OCTHRESH) || (bump_flag) ){
+		if( (cL<CLIFFMAX)||(cR<CLIFFMAX)|| (cFL<CLIFFMAX)||(cFR<CLIFFMAX) || wL||wR||wC || (sum_oR>=OCTHRESH) || (sum_oL>=OCTHRESH) || (bump_flag) ){
 			cout<<"NOT SAFE"<<endl;
 			//STOP DRIVING & PLAY SONG & Set safety flag
 			safety_mutex.lock();
@@ -176,7 +188,10 @@ void* safetyThread(void* data){
 			else{		//PLAY SONG IF IT WAS ANYTHING BUT A BUMP
 
 				robot_ptr->sendDriveCommand(0, Create::DRIVE_STRAIGHT);
-				//robot_ptr->sendPlaySongCommand((unsigned char)0);
+				restart = true;
+				speed_set = false;
+				_bumped = false;
+				robot_ptr->sendPlaySongCommand((unsigned char)0);
 
 			}
 
@@ -190,12 +205,12 @@ void* safetyThread(void* data){
 			speed_mutex.lock();
 			speed_set = false;
 			speed_mutex.unlock();
-			// cout << "NEW WAVE.........." << endl;
-			// cout<< "cliff signals: "<<cL<<" "<<cR<<" "<<cFL<<" "<<cFR<<endl;
-			// cout<< "wheel drop signals: "<<wL<<" "<<wR<<" "<<wC<<endl;
-			// cout<< "Overcurrent signals: "<<oL<<" "<<oR<<" "<<sum_oL<<" "<<sum_oR<<endl;
-			// cout << "bump flags:"<<bump_flag<<endl;
-			// cout << "..................." << endl;
+			cout << "NEW WAVE.........." << endl;
+			cout<< "cliff signals: "<<cL<<" "<<cR<<" "<<cFL<<" "<<cFR<<endl;
+			cout<< "wheel drop signals: "<<wL<<" "<<wR<<" "<<wC<<endl;
+			cout<< "Overcurrent signals: "<<oL<<" "<<oR<<" "<<sum_oL<<" "<<sum_oR<<endl;
+			cout << "bump flags:"<<bump_flag<<endl;
+			cout << "..................." << endl;
 		}
 		else{
 			//TELL THE ROBOT THAT IT IS SAFE TO MOVE
@@ -232,7 +247,20 @@ void* safetyThread(void* data){
 }
 
 
+void * test (void * data){
+	//DEBUGGING
+	//WAIT FOR A FEW SECONDS THEN END
+	int count =0;
+	while (1){
+		for (size_t i =0; i<30; i++){}
+		this_thread::sleep_for(chrono::milliseconds(PRIORITY_2_PERIOD));
+		count++;
+		cout<< "COUNT IS: "<<count<<endl;
+		if (count == 300)
+			pthread_exit(NULL);
+	}
 
+}
 
 
 
@@ -246,12 +274,14 @@ void* navigationThread(void* data){
 	short wallSignal;
 	vector <short> wallSignal_vector;
 	wallSignal_vector.reserve(WALL_SIGNAL_SAMPLES);		//reserve enough space
-	short vector_size;
+	short vector_size, lost_wall_count =0;
 	//flags
-	bool is_safe, has_bumped, has_set_speed, lost_wall, aligned = false;
+	bool is_safe, has_bumped, has_set_speed, lost_wall, aligned = false, to_restart;
 	//Timing
 	double sleep_time_ms;
 	Create* robot_ptr = (Create*)data;
+
+
 
 
 	//ALWAYS EXECUTING TASK
@@ -273,6 +303,13 @@ void* navigationThread(void* data){
 		speed_mutex.unlock();
 
 
+
+		if (!is_safe){
+			this_thread::sleep_for(chrono::milliseconds(PRIORITY_2_PERIOD));
+			continue;
+		}
+
+
 		robot_mutex.lock();
 		//SET THE SPEED TO MOVE FORWARD IF IT HAS NOT ALREADY BEEN SET
 		if (!has_set_speed && !has_bumped){
@@ -280,7 +317,9 @@ void* navigationThread(void* data){
 			cout<< "SETTING SPEED"<<endl;
 			speed_mutex.lock();
 			speed_set=true;
+			aligned = false;
 			speed_mutex.unlock();
+			wallSignal_vector.clear();
 		}
 		//ADD NEW WALL SIGNAL TO THE BUFFER
 		wallSignal_vector.push_back( robot_ptr->wallSignal());
@@ -296,7 +335,7 @@ void* navigationThread(void* data){
 		//update vector size
 		vector_size = wallSignal_vector.size();
 
-		cout<< "VECTOR SIZE: "<<vector_size<< endl;
+		cout<< "VECTOR SIZE: "<<vector_size<<" BUMPED: "<< has_bumped<< " ALIGNED: "<<aligned<<endl;
 
 		robot_mutex.lock();
 		//CHECK FOR ANY EVENTS
@@ -306,48 +345,52 @@ void* navigationThread(void* data){
 			lost_wall = true;
 			cout<< "WALL SIGNAL WAS: ";
 			for (i = 1; i<4; i++){
-				lost_wall = lost_wall &&  (wallSignal_vector[vector_size - i] ==0) ;
+				lost_wall = lost_wall &&  (wallSignal_vector[vector_size - i] <2) ;
 				cout<< wallSignal_vector[vector_size -i]<< " ";
 			}
 			cout<<endl;
-			size_t array_sum =0;
+			if (lost_wall)
+				lost_wall_count++;
+
+			//size_t array_sum =0;
 			//check for left/right sway
 			tilt_sum =0;
-			for (i=0; i<vector_size-1; i++){
-				signal_diff = wallSignal_vector[i+1] - wallSignal_vector[i];
+			for (i=1; i<vector_size; i++){
+				signal_diff = wallSignal_vector[i] - wallSignal_vector[i-1];		//+ve is an increase in wall sig
 				//ADD IF INCREASE SUBTRACT IF DECREASE
 				if (signal_diff>0){
 					tilt_sum++;
 					if (signal_diff > 5)
-						tilt_sum +5;
+						tilt_sum +=5;
 				}
 				else if (signal_diff<0){
 					tilt_sum--;
 					if (signal_diff < -5)
-						tilt_sum -5;
+						tilt_sum -=5;
 				}
-				array_sum= wallSignal_vector[i];
+				//array_sum= wallSignal_vector[i];
 			}
 			cout<< "TILT SUM: "<<tilt_sum<<endl;
 
 
 
 			//ACTIONS FOR ANY OF THE EVENTS
-			if(lost_wall){
+			if(lost_wall_count > 24){
 				cout<< "LOST WALL...ADJUSTING"<<endl;
 				//DRIVE FORWARD A LITTLE (250mm)
-				this_thread::sleep_for(chrono::milliseconds(200));
-				robot_ptr->sendDriveCommand(0, Create::DRIVE_INPLACE_CLOCKWISE);
+				//this_thread::sleep_for(chrono::milliseconds(1850));
+				//robot_ptr->sendDriveCommand(0, Create::DRIVE_INPLACE_CLOCKWISE);
 				//this_thread::sleep_for(chrono::milliseconds(3000));
 
-				if (robot_ptr->wallSignal() == 0){
+				if (robot_ptr->wallSignal() <2){
 					//ROTATE 100 DEGREES CLOCKWISE
 					robot_ptr->sendDriveCommand(TURNSPEED, Create::DRIVE_INPLACE_CLOCKWISE);
-					this_thread::sleep_for(chrono::milliseconds(1700));
+					this_thread::sleep_for(chrono::milliseconds(1610));
 					//CONTINUE DRIVING STRAIGHT
 					robot_ptr->sendDriveCommand(FULLSPEED, Create::DRIVE_STRAIGHT);
 					// //CLEAR THE SAMPLES
 					wallSignal_vector.clear();
+					lost_wall_count =0;
 				}
 				else{
 					cout<< "FALSE ALARM"<<endl;
@@ -356,24 +399,24 @@ void* navigationThread(void* data){
 				}
 
 			}
-			else if (tilt_sum > 0){
+			else if (tilt_sum > 0){		//increasing wall signal values
 				cout<< " ADJUSTING TO THE LEFT "<<endl;
 				//ROTATE A FEW DEGREES COUNTERCLOCKWISE
 				//robot_ptr->sendDriveCommand(TURNSPEED, Create::DRIVE_INPLACE_COUNTERCLOCKWISE);
-				robot_ptr->sendDriveDirectCommand( 90, 170);
-				this_thread::sleep_for(chrono::milliseconds(500));
+				robot_ptr->sendDriveDirectCommand( 10, 250);
+				this_thread::sleep_for(chrono::milliseconds(115));
 				//CONTINUE DRIVING STRAIGHT
 				robot_ptr->sendDriveCommand(FULLSPEED, Create::DRIVE_STRAIGHT);
 				// //CLEAR THE SAMPLES
 				wallSignal_vector.clear();
 
 			}
-			else if (tilt_sum < 0){
+			else if (tilt_sum < 0){		//decreasing wall signal values
 				cout<< " ADJUSTING TO THE RIGHT "<<endl;
 				//ROTATE A FEW DEGREES CLOCKWISEA
 				//robot_ptr->sendDriveCommand(TURNSPEED, Create::DRIVE_INPLACE_CLOCKWISE);
-				robot_ptr->sendDriveDirectCommand( 170, 90);
-				this_thread::sleep_for(chrono::milliseconds(500));
+				robot_ptr->sendDriveDirectCommand( 250, 10);
+				this_thread::sleep_for(chrono::milliseconds(115));
 				//CONTINUE DRIVING STRAIGHT
 				robot_ptr->sendDriveCommand(FULLSPEED, Create::DRIVE_STRAIGHT);
 				// //CLEAR THE SAMPLES
@@ -392,6 +435,9 @@ void* navigationThread(void* data){
 			_bumped = false;
 			bump_mutex.unlock();
 			aligned = true;
+			speed_mutex.lock();
+			speed_set=true;
+			speed_mutex.unlock();
 
 		}
 
@@ -437,10 +483,10 @@ void wall_alignment (Create* robot_ptr){
 	//MOVE CLOCKWISE A LITTLE
 	robot_ptr->sendDriveCommand(TURNSPEED, Create::DRIVE_INPLACE_CLOCKWISE);
 	//robot_mutex.unlock();
-	this_thread::sleep_for(chrono::milliseconds(600));
+	this_thread::sleep_for(chrono::milliseconds(800));
 	//REVERSE A LITTLE
 	robot_ptr->sendDriveCommand(REVERSESPEED, Create::DRIVE_STRAIGHT);
-	this_thread::sleep_for(chrono::milliseconds(15));
+	this_thread::sleep_for(chrono::milliseconds(8));
 
 	robot_ptr->sendDriveCommand(TURNSPEED, Create::DRIVE_INPLACE_COUNTERCLOCKWISE);
 	//FIND THE LOCAL MAXIMA
@@ -472,7 +518,7 @@ void wall_alignment (Create* robot_ptr){
 			//CHECK FOR A LOCAL MAXIMA
 			auto it = max_element(signal_vector.begin(), signal_vector.end());
 			//cout<< "MAX VALUE IS :" <<*it<<endl;
-			if ( (signal_vector[index] == *it)  && (signal_vector[index] > 30) && (signal_vector[index] > signal_vector[SWEEP_SAMPLE_SIZE-1]) ){
+			if ( (signal_vector[index] == *it)  && (signal_vector[index] > 10) && (signal_vector[index] > signal_vector[SWEEP_SAMPLE_SIZE-1]) ){
 			//if ( (signal_vector[index] > 40) ){
 				cout<< "GOING THE OTHER WAY"<<endl;
 				//robot_ptr->sendDriveCommand(0, Create::DRIVE_INPLACE_CLOCKWISE);
@@ -482,7 +528,7 @@ void wall_alignment (Create* robot_ptr){
 				//ROTATE BACK TO MAXIMA
 				robot_ptr->sendDriveCommand(TURNSPEED, Create::DRIVE_INPLACE_CLOCKWISE);
 				//robot_mutex.unlock();
-				this_thread::sleep_for(chrono::milliseconds(600));
+				this_thread::sleep_for(chrono::milliseconds(630));
 				//robot_mutex.lock();
 				//CONTINUE DRIVING STRAIGHT
 				robot_ptr->sendDriveCommand(FULLSPEED, Create::DRIVE_STRAIGHT);
@@ -1006,37 +1052,118 @@ void* mazePlotThread(void* data){
 //Thread resposnible for safety core
 void* objectIdentificationThread(void* data){
 	//Local variables
+	double sleep_time_ms;
+	bool found_lamp = false;
 
-	Create* robot_ptr = (Create*)data;
+	objectInput data_str = *((objectInput*)(data));
+	Create * robot_ptr = data_str.robot_ptr;
+    //
+	// //READ IN THE IMAGES
+	// map<string, Mat> queryImages ;
+	// //Mat img_query = imread(argv[1], IMREAD_GRAYSCALE);
+	// queryImages["ancient-lamp-600"] = imread("object-identification/query-image/low-resolution/ancient-lamp-600.jpg", IMREAD_GRAYSCALE);
+	// queryImages["audio-cassette-600"] = imread("object-identification/query-image/low-resolution/audio-cassette-600.jpg", IMREAD_GRAYSCALE);
+	// queryImages["mammoth-600"] = imread("object-identification/query-image/low-resolution/mammoth-600.jpg", IMREAD_GRAYSCALE);
+	// queryImages["mayan-calandar-600"] = imread("object-identification/query-image/low-resolution/mayan-calendar-600.jpg", IMREAD_GRAYSCALE);
+	// queryImages["mjolnir-hammer-600"] = imread("object-identification/query-image/low-resolution/mjolnir-hammer-600.jpg", IMREAD_GRAYSCALE);
+	// queryImages["one-ring-600"] = imread("object-identification/query-image/low-resolution/one-ring-600.jpg", IMREAD_GRAYSCALE);
+	// queryImages["pueblo-pot-600"] = imread("object-identification/query-image/low-resolution/pueblo-pot-600.jpg", IMREAD_GRAYSCALE);
+	// queryImages["roman-glass-600"] = imread("object-identification/query-image/low-resolution/roman-glass-600.jpg", IMREAD_GRAYSCALE);
+	// queryImages["willow-plate-600"] = imread("object-identification/query-image/low-resolution/willow-plate-600.jpg", IMREAD_GRAYSCALE);
+	// queryImages["magic-lamp-600"] = imread("object-identification/query-image/low-resolution/magic-lamp-600.jpg", IMREAD_GRAYSCALE);
+    //
+ 	// map<string, Mat>::iterator it = queryImages.begin();
+	// cout<< "type is: "<<it->first<<endl;
 
-	//READ IN THE IMAGES
-	map<string, Mat> queryImages;
-	//Mat img_query = imread(argv[1], IMREAD_GRAYSCALE);
-	queryImages["ancient-lamp-600"] = imread("object-identification/query-image/low-resolution/ancient-lamp-600.jpg", IMREAD_GRAYSCALE);
-	queryImages["audio-cassette-600"] = imread("object-identification/query-image/low-resolution/audio-cassette-600.jpg", IMREAD_GRAYSCALE);
-	queryImages["mammoth-600"] = imread("object-identification/query-image/low-resolution/mammoth-600.jpg", IMREAD_GRAYSCALE);
-	queryImages["mayan-calandar-600"] = imread("object-identification/query-image/low-resolution/mayan-calandar-600.jpg", IMREAD_GRAYSCALE);
-	queryImages["mjolnir-hammer-600"] = imread("object-identification/query-image/low-resolution/mjolnir-hammer-600.jpg", IMREAD_GRAYSCALE);
-	queryImages["one-ring-600"] = imread("object-identification/query-image/low-resolution/one-ring-600.jpg", IMREAD_GRAYSCALE);
-	queryImages["pueblo-pot-600"] = imread("object-identification/query-image/low-resolution/pueblo-pot-600.jpg", IMREAD_GRAYSCALE);
-	queryImages["roman-glass-600"] = imread("object-identification/query-image/low-resolution/roman-glass-600.jpg", IMREAD_GRAYSCALE);
-	queryImages["willow-plate-600"] = imread("object-identification/query-image/low-resolution/willow-plate-600.jpg", IMREAD_GRAYSCALE);
-	queryImages["magic-lamp-600"] = imread("object-identification/query-image/low-resolution/magic-lamp-600.jpg", IMREAD_GRAYSCALE);
+	//FIND ALADIN
+	raspicam::RaspiCam_Cv Camera;
 
-	while (queryImages.size() > 0 && safe_flag) {
-		raspicam::RaspiCam_Cv Camera;
-		//cv::Mat rgb_image, bgr_image;
-		//if (!Camera.open()) {
-		//	cerr << "Error opening the camera" << endl;
-		//	break;
-		//}
-	    Camera.grab();
-		Mat img_scene_full, rgb;
-		Camera.retrieve(img_scene_full);
-		cv::cvtColor(img_scene_full, rgb, CV_RGB2BGR);
-		cv::imwrite("results/imageTaken.jpg", rgb);
-		queryImages = detect_object(queryImages, img_scene_full);
+	if (!Camera.open()) {
+		cerr << "Error opening the camera in thread" << endl;
 	}
+
+	//WHILE THERE IS STILL SOMETHING TO FIND
+	while(   (data_str.queryImages_ptr->size() > 0 && safe_flag) && (!found_lamp)   ){
+		auto t_start = std::chrono::system_clock::now();
+		cv::Mat rgb_image, bgr_image;
+	    Camera.grab();
+		//cv::Mat img_scene_full, rgb;
+		Camera.retrieve(bgr_image);
+		cv::cvtColor(bgr_image, rgb_image, CV_RGB2BGR);
+		cv::imwrite("results/imageTaken.jpg", rgb_image);
+		 cout<<"...............TAKEN A PIC................."<<endl;
+		// this_thread::sleep_for(chrono::milliseconds(2500));
+		//queryImages = detect_object(queryImages, bgr_image, data_str);
+		image_vect.push_back(bgr_image);
+		*(data_str.queryImages_ptr) = detect_object(*(data_str.queryImages_ptr), bgr_image, data_str, &found_lamp);
+
+		cout<< "FOUND LAMP: "<<found_lamp<<endl;
+		//FOUND THE LAMP:
+		if (found_lamp){
+			//TURN THE LIGHT ON & SHOW A RED LIGHT
+			//robot_ptr->sendLedCommand(Create::LED_NONE, Create::LED_COLOR_RED, Create::LED_INTENSITY_FULL);
+			//SLEEP FOR 2S
+			cout<<"...............FOUND LAMP ................."<<endl;
+			this_thread::sleep_for(chrono::milliseconds(2000));
+
+			found_lamp = true; ;
+			//robot_ptr->sendLedCommand(Create::LED_NONE, Create::LED_COLOR_RED, Create::LED_INTENSITY_OFF);
+		}
+
+
+		auto t_end = std::chrono::system_clock::now();
+		//COMPUTE SLEEP TIME
+		auto time_diff_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start);
+		sleep_time_ms = PRIORITY_3_PERIOD - time_diff_ms.count();
+
+
+		cout<<"............FINISHED DETECTING............."<<endl;
+		//Sleep to complete period
+		if (time_diff_ms.count() > 0)
+			this_thread::sleep_for(chrono::milliseconds((long)sleep_time_ms));
+		else
+			this_thread::sleep_for(chrono::milliseconds(PRIORITY_3_PERIOD));
+
+
+	}
+
+
+
+	cout<< "OUT OF LOOP "<<endl;
+	//JUST KEEP TAKING PICS EVERY PERIOD
+	while (1){
+		auto t_start = std::chrono::system_clock::now();
+		cv::Mat rgb_image, bgr_image;
+
+		Camera.grab();
+		Camera.retrieve(bgr_image);
+		cv::cvtColor(bgr_image, rgb_image, CV_RGB2BGR);
+		image_vect.push_back(bgr_image);
+		cout<<"...............TAKEN A PIC OUT OF LOOP ................."<<endl;
+		//SLEEP FOR REST OF PERIOD
+
+		cv::imwrite("results/imageTaken.jpg", rgb_image);
+		cv::imwrite("results/imageVect.jpg", image_vect.back());
+
+		this_thread::sleep_for(chrono::milliseconds(5000));
+
+		auto t_end = std::chrono::system_clock::now();
+
+		//COMPUTE SLEEP TIME
+		auto time_diff_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start);
+		sleep_time_ms = PRIORITY_3_PERIOD - time_diff_ms.count();
+		//Sleep to complete period
+		if (time_diff_ms.count() > 0)
+			this_thread::sleep_for(chrono::milliseconds((long)sleep_time_ms));
+		else
+			this_thread::sleep_for(chrono::milliseconds(PRIORITY_3_PERIOD));
+
+		if (image_vect.size()>7)
+			pthread_exit(NULL);
+
+	}
+
+
 }
 
 
@@ -1062,42 +1189,42 @@ int main ()
   char serial_loc[] = "/dev/ttyUSB0";
 
    try {
-    raspicam::RaspiCam_Cv Camera;
-    cv::Mat rgb_image, bgr_image;
-    if (!Camera.open()) {
-      cerr << "Error opening the camera" << endl;
-      return -1;
-    }
-    cout << "Opened Camera" << endl;
-    SerialStream stream (serial_loc, LibSerial::SerialStreamBuf::BAUD_57600);
-    cout << "Opened Serial Stream to" << serial_loc << endl;
-    this_thread::sleep_for(chrono::milliseconds(1000));
-    Create robot(stream);
-    cout << "Created iRobot Object" << endl;
-    robot.sendFullCommand();
-    cout << "Setting iRobot to Full Mode" << endl;
-    this_thread::sleep_for(chrono::milliseconds(1000));
-    cout << "Robot is ready" << endl;
-
-
-    // Let's stream some sensors.
-    Create::sensorPackets_t sensors;
-    sensors.push_back(Create::SENSOR_BUMPS_WHEELS_DROPS);
-    sensors.push_back(Create::SENSOR_WALL_SIGNAL);
-    sensors.push_back (Create::SENSOR_BUTTONS);
-	sensors.push_back (Create::SENSOR_CLIFF_LEFT_SIGNAL);
-	sensors.push_back (Create::SENSOR_CLIFF_FRONT_LEFT_SIGNAL);
-	sensors.push_back (Create::SENSOR_CLIFF_FRONT_RIGHT_SIGNAL);
-	sensors.push_back (Create::SENSOR_CLIFF_RIGHT_SIGNAL);
-	sensors.push_back (Create::SENSOR_OVERCURRENTS);
-    robot.sendStreamCommand (sensors);
-    cout << "Sent Stream Command" << endl;
-
-	//Create songs
-    Create:: note_t note(pair<unsigned char, unsigned char>(85, 8));
-	Create:: song_t song;
-	song.push_back(note);
-	robot.sendSongCommand((unsigned char)0, song);
+    // raspicam::RaspiCam_Cv Camera;
+    // cv::Mat rgb_image, bgr_image;
+    // if (!Camera.open()) {
+    //   cerr << "Error opening the camera" << endl;
+    //   return -1;
+    // }
+    // cout << "Opened Camera" << endl;
+    // SerialStream stream (serial_loc, LibSerial::SerialStreamBuf::BAUD_57600);
+    // cout << "Opened Serial Stream to" << serial_loc << endl;
+    // this_thread::sleep_for(chrono::milliseconds(1000));
+    // Create robot(stream);
+    // cout << "Created iRobot Object" << endl;
+    // robot.sendFullCommand();
+    // cout << "Setting iRobot to Full Mode" << endl;
+    // this_thread::sleep_for(chrono::milliseconds(1000));
+    // cout << "Robot is ready" << endl;
+    //
+    //
+    // // Let's stream some sensors.
+    // Create::sensorPackets_t sensors;
+    // sensors.push_back(Create::SENSOR_BUMPS_WHEELS_DROPS);
+    // sensors.push_back(Create::SENSOR_WALL_SIGNAL);
+    // sensors.push_back (Create::SENSOR_BUTTONS);
+	// sensors.push_back (Create::SENSOR_CLIFF_LEFT_SIGNAL);
+	// sensors.push_back (Create::SENSOR_CLIFF_FRONT_LEFT_SIGNAL);
+	// sensors.push_back (Create::SENSOR_CLIFF_FRONT_RIGHT_SIGNAL);
+	// sensors.push_back (Create::SENSOR_CLIFF_RIGHT_SIGNAL);
+	// sensors.push_back (Create::SENSOR_OVERCURRENTS);
+    // robot.sendStreamCommand (sensors);
+    // cout << "Sent Stream Command" << endl;
+    //
+	// //Create songs
+    // Create:: note_t note(pair<unsigned char, unsigned char>(85, 8));
+	// Create:: song_t song;
+	// song.push_back(note);
+	// robot.sendSongCommand((unsigned char)0, song);
 
 	//Create a few threads
 	pthread_t thread_ids[NUMTHREADS];
@@ -1110,6 +1237,52 @@ int main ()
 	// robot.sendDriveDirectCommand(0,0);
 	// printf("WALLSIGNAL IS: %d\n",robot.wallSignal() );
 	// while(1){}
+
+	/* PRECOMPUTE FEATURES */
+	//READ IN THE IMAGES
+	map<string, Mat> queryImages;
+
+	queryImages["magic-lamp-600"] = imread("object-identification/query-image/low-resolution/magic-lamp-600.jpg", IMREAD_GRAYSCALE);
+	// queryImages["ancient-lamp-600"] = imread("object-identification/query-image/low-resolution/ancient-lamp-600.jpg", IMREAD_GRAYSCALE);
+	// queryImages["audio-cassette-600"] = imread("object-identification/query-image/low-resolution/audio-cassette-600.jpg", IMREAD_GRAYSCALE);
+	// queryImages["mammoth-600"] = imread("object-identification/query-image/low-resolution/mammoth-600.jpg", IMREAD_GRAYSCALE);
+	// queryImages["mayan-calandar-600"] = imread("object-identification/query-image/low-resolution/mayan-calendar-600.jpg", IMREAD_GRAYSCALE);
+	// queryImages["mjolnir-hammer-600"] = imread("object-identification/query-image/low-resolution/mjolnir-hammer-600.jpg", IMREAD_GRAYSCALE);
+	// queryImages["one-ring-600"] = imread("object-identification/query-image/low-resolution/one-ring-600.jpg", IMREAD_GRAYSCALE);
+	// queryImages["pueblo-pot-600"] = imread("object-identification/query-image/low-resolution/pueblo-pot-600.jpg", IMREAD_GRAYSCALE);
+	// queryImages["roman-glass-600"] = imread("object-identification/query-image/low-resolution/roman-glass-600.jpg", IMREAD_GRAYSCALE);
+	// queryImages["willow-plate-600"] = imread("object-identification/query-image/low-resolution/willow-plate-600.jpg", IMREAD_GRAYSCALE);
+
+
+	int minHessian = 100;
+	int nOctaves = 4;
+	int nOctaveLayers = 3;
+	Ptr<SURF> detector = SURF::create(minHessian, nOctaves, nOctaveLayers, true);
+
+	vector<KeyPoint> keypoints_query;
+	Mat descriptors_query;
+	map<string, vector<KeyPoint>> keypoints_query_map;
+	map<string, Mat> descriptors_query_map;
+
+
+	map<string, Mat>::iterator iter;
+	for (iter = queryImages.begin(); iter != queryImages.end(); ++iter) {
+		Mat img_query = iter->second;
+		detector->detectAndCompute(
+			img_query, Mat(), keypoints_query, descriptors_query);
+
+		keypoints_query_map[iter->first] = keypoints_query;
+		descriptors_query_map[iter->first] = descriptors_query;
+	}
+
+
+	objectInput object_input;
+	object_input.keypoints_query_map_ptr = &keypoints_query_map;
+	object_input.descriptors_query_map_ptr = &descriptors_query_map;
+	object_input.queryImages_ptr = & queryImages;
+	//object_input.robot_ptr = &robot;
+
+
 
 
 
@@ -1142,17 +1315,72 @@ int main ()
 
 
 	//CREATE THE THEADS
-	pthread_create(&thread_ids[0], &attrSafety, safetyThread,(void*)&robot);
-	pthread_create(&thread_ids[1], &attrMotion, navigationThread,(void*)&robot);
+	//pthread_create(&thread_ids[0], &attrSafety, safetyThread,(void*)&robot);
+	//pthread_create(&thread_ids[1], &attrMotion, navigationThread,(void*)&robot);
 	//pthread_create(&thread_ids[2], &attrMotion, mazePlotThread,(void*)&robot);
-	//pthread_create(&thread_ids[3], NULL, objectIdentificationThread,(void*)&robot);
+	pthread_create(&thread_ids[1], &attrMotion, test, NULL );
+	pthread_create(&thread_ids[3], NULL, objectIdentificationThread,(void*)&object_input);
 
 
 
-	while(1){
-			// cout << "Main thread:" << robot.wallSignal() <<" "<<robot.bumpRight()<< endl;
-			// this_thread::sleep_for(chrono::milliseconds(100));
+	//Waits for nav to finish
+	pthread_join(thread_ids[1], NULL);
+	cout<< ".....FINISHED NAV THREAD ......."<<endl;
+
+	queryImages.clear();
+
+	//PERFORM OBJECT IDENTIFICATION ON REST OF IMAGES
+	queryImages["ancient-lamp-600"] = imread("object-identification/query-image/low-resolution/ancient-lamp-600.jpg", IMREAD_GRAYSCALE);
+	queryImages["audio-cassette-600"] = imread("object-identification/query-image/low-resolution/audio-cassette-600.jpg", IMREAD_GRAYSCALE);
+	queryImages["mammoth-600"] = imread("object-identification/query-image/low-resolution/mammoth-600.jpg", IMREAD_GRAYSCALE);
+	queryImages["mayan-calandar-600"] = imread("object-identification/query-image/low-resolution/mayan-calendar-600.jpg", IMREAD_GRAYSCALE);
+	queryImages["mjolnir-hammer-600"] = imread("object-identification/query-image/low-resolution/mjolnir-hammer-600.jpg", IMREAD_GRAYSCALE);
+	queryImages["one-ring-600"] = imread("object-identification/query-image/low-resolution/one-ring-600.jpg", IMREAD_GRAYSCALE);
+	queryImages["pueblo-pot-600"] = imread("object-identification/query-image/low-resolution/pueblo-pot-600.jpg", IMREAD_GRAYSCALE);
+	queryImages["roman-glass-600"] = imread("object-identification/query-image/low-resolution/roman-glass-600.jpg", IMREAD_GRAYSCALE);
+	queryImages["willow-plate-600"] = imread("object-identification/query-image/low-resolution/willow-plate-600.jpg", IMREAD_GRAYSCALE);
+
+	for (iter = queryImages.begin(); iter != queryImages.end(); ++iter) {
+		Mat img_query = iter->second;
+		detector->detectAndCompute(
+			img_query, Mat(), keypoints_query, descriptors_query);
+
+		keypoints_query_map[iter->first] = keypoints_query;
+		descriptors_query_map[iter->first] = descriptors_query;
 	}
+
+	// object_input.keypoints_query_map_ptr = &keypoints_query_map;
+	// object_input.descriptors_query_map_ptr = &descriptors_query_map;
+	// object_input.queryImages_ptr = & queryImages;
+
+
+
+	bool a = false;
+	unsigned int cnt=0, size = queryImages.size();
+	cout<< "VECTOR SIZE: "<< image_vect.size()<<endl;
+
+
+	for (size_t i =0; i<image_vect.size(); i++){
+		cout<< "VECTOR SIZE: "<< image_vect.size()<<endl;
+		cv::Mat rgb_image;
+		cout <<"PIC NO: "<<i<<endl;
+		cv::cvtColor(image_vect[i], rgb_image, CV_RGB2BGR);
+		cv::imwrite("results/imageTaken.jpg", rgb_image);
+		cv::imwrite("results/vectImage.jpg", image_vect[i]);
+		a = false;
+		detect_object(queryImages, image_vect[i], object_input, &a);
+		if (a){
+			cnt++;
+		}
+		this_thread::sleep_for(chrono::milliseconds(5000));
+
+		if (queryImages.size() <=0)
+			break;
+	}
+	cout<< "FINISHED PROCESSING"<<endl;
+	cout<< "FOUND: "<<cnt<<" OUT OF "<<size<<endl;
+
+	while(1){}
 
 
 
@@ -1221,7 +1449,7 @@ int main ()
   //
   //
     cout << "Play button pressed, stopping Robot" << endl;
-    robot.sendDriveCommand (0, Create::DRIVE_STRAIGHT);
+    //robot.sendDriveCommand (0, Create::DRIVE_STRAIGHT);
   }
   catch (InvalidArgument& e)
   {
@@ -1245,12 +1473,19 @@ int main ()
 
 
 /*PASSES IN MAP OF PHOTO NAMES->MATRICES OF PHOTOS, AND A MATRIX OF THE CURRENT SCENE*/
-map<string, Mat> detect_object(map<string, Mat> img_querys, Mat img_scene_full) {
+map<string, Mat> detect_object(map<string, Mat> &img_querys, Mat &img_scene_full, objectInput data_str, bool* found_lamp) {
 	try {
 		map<string, Mat>::iterator iter;
-		for (iter = img_querys.begin(); iter != img_querys.end(); ++iter) {
+		for (iter = img_querys.begin();   (iter != img_querys.end())&&(img_querys.size()>0)   ; iter++) {
 
-			const char *output_file = ("results/" + iter->first + ".jpg").c_str();
+			string output_file = ("results/" + iter->first + ".png");
+			// char output_file[255] = {0};
+			// cout<< "iterator is: "<< iter->first<<endl;
+			// string output
+            //
+			//sprintf(output_file, "results/%s.png", iter->first);
+
+
 			Mat img_query = iter->second;
 
 			/* USE FOR READING IN THE IMAGES*/
@@ -1260,6 +1495,7 @@ map<string, Mat> detect_object(map<string, Mat> img_querys, Mat img_scene_full) 
 
 			//char *output_file = argv[3];
 			float keep_top_fraction = .85; // std::stof(argv[4]);
+			cout<< "LOOKING FOR: "<< iter->first<<endl;
 
 			if (!img_query.data || !img_scene_full.data) {
 				cout << "Error reading images" << endl;
@@ -1287,14 +1523,18 @@ map<string, Mat> detect_object(map<string, Mat> img_querys, Mat img_scene_full) 
 			vector<KeyPoint> keypoints_query, keypoints_scene;
 			Mat descriptors_query, descriptors_scene;
 
-			auto sttime = steady_clock::now();
-			detector->detectAndCompute(
-				img_query, Mat(), keypoints_query, descriptors_query);
-			cout << "Feature extraction query image "
-				<< (duration <double>(steady_clock::now() - sttime)).count()
-				<< " sec" << endl;
+			// auto sttime = steady_clock::now();
+			// detector->detectAndCompute(
+			// 	img_query, Mat(), keypoints_query, descriptors_query);
+			// cout << "Feature extraction query image "
+			// 	<< (duration <double>(steady_clock::now() - sttime)).count()
+			// 	<< " sec" << endl;
 
-			sttime = steady_clock::now();
+			keypoints_query = (*(data_str.keypoints_query_map_ptr))[iter->first];
+			descriptors_query = (*(data_str.descriptors_query_map_ptr))[iter->first];
+
+
+			auto sttime = steady_clock::now();
 			detector->detectAndCompute(
 				img_scene, Mat(), keypoints_scene, descriptors_scene);
 			cout << "Feature extraction scene image "
@@ -1349,11 +1589,28 @@ map<string, Mat> detect_object(map<string, Mat> img_querys, Mat img_scene_full) 
 						Scalar(255, 240, 240), CV_FILLED);
 				}
 				if (res) {
-					cout << "Object found" << endl;
+					cout << "<<<<<<<<<<<<<<<   Object found	>>>>>>>>>>>>>>>>>" << endl;
 					drawProjection(img_matches, img_query, scene_corners);
+					*found_lamp = true;
 					// Write result to a file
+
 					cv::imwrite(output_file, img_matches);
-					img_querys.erase(iter);
+					//cout<< "OUTPUTFILE IS"<<  output_file<<endl;
+					//cv::imwrite("results/output.png", img_matches);
+					//cvSaveImage(output_file, (IplImage(img_matches)));
+					iter = img_querys.erase(iter);
+
+					//cout<< "iter: "<<img_querys.begin()<< " "<< img_querys.end()<< " "<< iter<<endl;
+
+
+					if (iter != img_querys.begin()){
+						iter--;
+					}
+					if (iter == img_querys.end())
+						return img_querys;
+					//if (img_querys.size() == 0)
+						//iter = img_querys.end();
+					//iter = img_querys.begin();
 				}
 				else {
 					cout << "Object not found" << endl;
