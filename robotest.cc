@@ -14,6 +14,7 @@
 #include <pthread.h>
 #include <mutex>
 #include <time.h>
+#include <signal.h>
 
 using namespace cv;
 using namespace cv::xfeatures2d;
@@ -22,26 +23,26 @@ using namespace cv::xfeatures2d;
 #define RED 100
 #define OFF 0
 #define NUMTHREADS 4
-#define CLIFFMAX 100
+#define CLIFFMAX 50
 #define RANGE 2
 #define SAMPLES 3
 #define WALLSAMPLES 100
 #define MIDINDEX 50
-#define OCTHRESH 3
+#define OCTHRESH 10
 
 #define RIGHTWHEELSPEED 170
 #define LEFTWHEELSPEED 30
 #define ADJUST_SAMPLES 15
 
 //PERIODS FOR EACH PRIORITY IN MS
-#define PRIORITY_1_PERIOD 50
-#define PRIORITY_2_PERIOD 100
-#define PRIORITY_3_PERIOD 5000
+#define PRIORITY_1_PERIOD 75
+#define PRIORITY_2_PERIOD 105 //120
+#define PRIORITY_3_PERIOD 3000
 
 
 //ROBOT SPEEDS
-#define FULLSPEED 150
-#define TURNSPEED 150
+#define FULLSPEED 135//138
+#define TURNSPEED 100
 #define REVERSESPEED -200
 
 
@@ -49,6 +50,10 @@ using namespace cv::xfeatures2d;
 #define WALL_SIGNAL_SAMPLES 3
 #define SWEEP_SAMPLE_SIZE 150
 #define SAFETY_MARGIN 60
+
+//FOR CONTOUR PLOTTING
+#define LEFT_TURN 1
+#define RIGHT_TURN 0
 
 
 
@@ -66,6 +71,7 @@ mutex speed_mutex;
 mutex restart_mutex;
 
 
+
 //FLAGS
 volatile bool safe_flag = true;
 volatile bool speed_set = false;
@@ -73,11 +79,17 @@ volatile bool _bumped = false;
 volatile bool done = false;
 volatile bool waypoint_change = false;
 volatile bool restart = true;
+volatile bool finished = false;
+volatile bool first = true;
+volatile unsigned int photos_taken = 0;
+volatile bool safe_abort = false;
+auto robo_start = std::chrono::system_clock::now();
 
 
 //GLOBAL VARS
 volatile short rot_angle;
 vector <cv::Mat> image_vect;
+vector <unsigned int> turn_vect; 	//
 
 
 enum states {DRIVE, CALLIBRATE, LEFT_ADJUST, RIGHT_ADJUST, HARD_RIGHT};
@@ -89,6 +101,7 @@ typedef struct objectInput{
 	map<string, Mat>* descriptors_query_map_ptr;
 	map<string, Mat>* queryImages_ptr;
 	Create * robot_ptr;
+	vector <cv::Mat>* image_vect_ptr;
 }objectInput;
 
 
@@ -103,27 +116,42 @@ string type2str(int type);
 void usage();
 map<string, Mat> detect_object(map<string, Mat>& img_querys, Mat &img_scene_full, objectInput data_str, bool* found_lamp) ;
 
+struct sigaction act;
+
+void sighandler(int signum, siginfo_t *info, void *ptr){
+	safe_abort = true;
+}
+
+
+
+
+
+
+
+
 
 
 //Thread resposnible for safety core
 void* safetyThread(void* data){
 	//Local variables
-	short cL, cR, cFL, cFR, sum_oR, sum_oL;
+	short cL, cR, cFL, cFR, sum_oR, sum_oL, sum_cL, sum_cR, sum_cFL, sum_CFR;
 	bool wL, wR, wC, oR, oL, bump_flag = false;
 	bool or_arr[SAMPLES] = {0};
 	bool ol_arr[SAMPLES] = {0};
-	vector<bool> ol_vector, or_vector;
+	vector<bool> ol_vector, or_vector, cliff_vector;
 	Create* robot_ptr = (Create*)data;
 	short wallSignal;
 	size_t i;
 	int lock_status;
-	double sleep_time_ms;
+	double sleep_time_ms, runtime_ms;
 
 	//debugging
 	size_t max_c =0;
 
 //ALWAYS RUNNING TASK
 	while (1){
+
+
 		//cout<< "In safety thread"<<endl;
 		//STORE THE START TIME OF THE THREAD
 		//auto t_start = std::chrono::system_clock::now();
@@ -131,6 +159,30 @@ void* safetyThread(void* data){
 		while (!robot_mutex.try_lock()){
 			this_thread::sleep_for(chrono::milliseconds(PRIORITY_1_PERIOD));
 		}
+
+		//check timing
+		auto current_time = std::chrono::system_clock::now();
+		auto runtime_ms = std::chrono::duration_cast<std::chrono::milliseconds>(current_time - robo_start);
+		cout<< "TIME IS: "<<runtime_ms.count() /1000<<endl;
+		if (  (runtime_ms.count() > 120000) || 	robot_ptr->playButton()	){
+			cout<<"*********	TIME LIMIT EXCEEDED	**********"<<endl;
+			finished = true;
+			robot_ptr->sendDriveCommand(0, Create::DRIVE_STRAIGHT);
+			robot_mutex.unlock();
+			pthread_exit(NULL);
+		}
+
+
+		if(safe_abort){
+			robot_ptr->sendDriveCommand(0, Create::DRIVE_STRAIGHT);
+			robot_ptr->sendLedCommand(Create::LED_NONE, Create::LED_COLOR_RED, Create::LED_INTENSITY_FULL);
+			robot_mutex.unlock();
+			finished = true;
+			pthread_exit(NULL);
+		}
+
+
+		//cout<<"---------	IN SAFETY---------"<<endl;
 		auto t_start = std::chrono::system_clock::now();
 		//cout<<"GOT LOCK"<<endl;
 		//robot_mutex.lock();
@@ -139,6 +191,16 @@ void* safetyThread(void* data){
 		cR = robot_ptr->cliffRightSignal();
 		cFL = robot_ptr->cliffFrontLeftSignal();
 		cFR = robot_ptr->cliffFrontRightSignal();
+
+
+		//seen_cliff = false;
+		//for (size_t i =0; i< )
+
+		// sum_cL.push_back(cL);
+		// sum_cR. push_back(cR);
+		// sum_cFL.push_back(CFL);
+		// sum_CFR.push_back(CFR);
+
 		//Wheel Drop Sensors
 		wL = robot_ptr->wheeldropLeft();
 		wR = robot_ptr->wheeldropRight();
@@ -150,8 +212,11 @@ void* safetyThread(void* data){
 		bump_flag = robot_ptr->bumpLeft () || robot_ptr->bumpRight ();
 
 		//CHECK IF PLAY BUTTON PRESSED
-		if(robot_ptr->playButton())
-			done = true;
+		// if(robot_ptr->playButton()){
+		// 	cout<< "*****************	PLAY BUTTON PRESSED	***********"<<endl;
+		// 	finished = true;
+		// }
+			//done = true;
 		//robot_mutex.unlock();
 
 
@@ -159,12 +224,15 @@ void* safetyThread(void* data){
 			ol_vector.erase(ol_vector.begin());
 		if (or_vector.size() > SAMPLES)
 			or_vector.erase(or_vector.begin());
+		// if (cliff_vector.size() > SAMPLES)
+		// 	cliff_vector.erase(or_vector.begin());
 
 		//GET AVG OVERCURRENT SIGNALS
-		sum_oL =0;	sum_oR =0;
+		sum_oL =0;	sum_oR =0; ; //sum_cliff =0;
 		for (i =0; i<SAMPLES; i++){
 			sum_oR += or_vector[i];
 			sum_oL += ol_vector[i];
+			//sum_cliff += cliff_vector[i];
 		}
 
 		if( (cL<CLIFFMAX)||(cR<CLIFFMAX)|| (cFL<CLIFFMAX)||(cFR<CLIFFMAX) || wL||wR||wC || (sum_oR>=OCTHRESH) || (sum_oL>=OCTHRESH) || (bump_flag) ){
@@ -183,6 +251,11 @@ void* safetyThread(void* data){
 				this_thread::sleep_for(chrono::milliseconds(30));
 				robot_ptr->sendDriveCommand(0, Create::DRIVE_STRAIGHT);
 				_bumped = true;
+				if (first){
+					robo_start = std::chrono::system_clock::now();
+					first = false;
+				}
+
 
 			}
 			else{		//PLAY SONG IF IT WAS ANYTHING BUT A BUMP
@@ -238,6 +311,7 @@ void* safetyThread(void* data){
 			cout<< "SAFETY SLEEP TIME: "<<sleep_time_ms<<endl;
 		}
 
+		//cout<<"---------	LEAVING SAFETY---------"<<endl;
 		//Sleep to complete period
 		if (time_diff_ms.count() > 0)
 			this_thread::sleep_for(chrono::milliseconds((long)sleep_time_ms));
@@ -271,7 +345,7 @@ void* navigationThread(void* data){
 	size_t i;
 	int tilt_sum, signal_diff;
 	//wall signal stuff
-	short wallSignal;
+	short wallSignal,  lastWallSignal;
 	vector <short> wallSignal_vector;
 	wallSignal_vector.reserve(WALL_SIGNAL_SAMPLES);		//reserve enough space
 	short vector_size, lost_wall_count =0;
@@ -286,7 +360,11 @@ void* navigationThread(void* data){
 
 	//ALWAYS EXECUTING TASK
 	while(1){
+		if (finished){
+			pthread_exit(NULL);
+		}
 		//Get start time
+		//cout<<"---------	IN NAVIGATION	---------"<<endl;
 		auto t_start = std::chrono::system_clock::now();
 
 		//POLL THE WALL SIGNALS, SAFETY FLAG, BUMPED FLAG, SET SPEED FLAGS
@@ -310,7 +388,12 @@ void* navigationThread(void* data){
 		}
 
 
-		robot_mutex.lock();
+		while (!robot_mutex.try_lock()){
+			this_thread::sleep_for(chrono::milliseconds(PRIORITY_1_PERIOD));
+			continue;
+		}
+
+
 		//SET THE SPEED TO MOVE FORWARD IF IT HAS NOT ALREADY BEEN SET
 		if (!has_set_speed && !has_bumped){
 			robot_ptr->sendDriveCommand(FULLSPEED, Create::DRIVE_STRAIGHT);
@@ -335,65 +418,103 @@ void* navigationThread(void* data){
 		//update vector size
 		vector_size = wallSignal_vector.size();
 
-		cout<< "VECTOR SIZE: "<<vector_size<<" BUMPED: "<< has_bumped<< " ALIGNED: "<<aligned<<endl;
+		//cout<< "VECTOR SIZE: "<<vector_size<<" BUMPED: "<< has_bumped<< " ALIGNED: "<<aligned<<endl;
 
 		robot_mutex.lock();
 		//CHECK FOR ANY EVENTS
 		if ( (vector_size == WALL_SIGNAL_SAMPLES) && (!has_bumped) && (aligned) ){		//taken enough samples & not a bump event
-			cout<< "Checking walls....."<<endl;
+			//cout<< "Checking walls....."<<endl;
 			//Check for lost wall signal
 			lost_wall = true;
 			cout<< "WALL SIGNAL WAS: ";
 			for (i = 1; i<4; i++){
-				lost_wall = lost_wall &&  (wallSignal_vector[vector_size - i] <2) ;
+				lost_wall = lost_wall &&  (wallSignal_vector[vector_size - i] <=2) ;
 				cout<< wallSignal_vector[vector_size -i]<< " ";
 			}
 			cout<<endl;
-			if (lost_wall)
+			if (lost_wall){
+
 				lost_wall_count++;
+				cout<<"LOST WALL; COUNT IS: "<<lost_wall_count<<endl;
+			}
+			else {
+				lost_wall_count =0;
+			}
 
 			//size_t array_sum =0;
 			//check for left/right sway
+			// tilt_sum =0;
+			// for (i=1; i<vector_size; i++){
+			// 	signal_diff = wallSignal_vector[i] - wallSignal_vector[i-1];		//+ve is an increase in wall sig
+			// 	//ADD IF INCREASE SUBTRACT IF DECREASE
+			// 	if (signal_diff>0){
+			// 		tilt_sum++;
+			// 		if (signal_diff > 5)
+			// 			tilt_sum +=5;
+			// 	}
+			// 	else if (signal_diff<0){
+			// 		tilt_sum--;
+			// 		if (signal_diff < -5)
+			// 			tilt_sum -=5;
+			// 	}
+			// 	//array_sum= wallSignal_vector[i];
+			// }
+			//cout<< "TILT SUM: "<<tilt_sum<<endl;
+
 			tilt_sum =0;
-			for (i=1; i<vector_size; i++){
-				signal_diff = wallSignal_vector[i] - wallSignal_vector[i-1];		//+ve is an increase in wall sig
-				//ADD IF INCREASE SUBTRACT IF DECREASE
-				if (signal_diff>0){
-					tilt_sum++;
-					if (signal_diff > 5)
-						tilt_sum +=5;
-				}
-				else if (signal_diff<0){
-					tilt_sum--;
-					if (signal_diff < -5)
-						tilt_sum -=5;
-				}
-				//array_sum= wallSignal_vector[i];
+			i = vector_size-1;
+			signal_diff = wallSignal_vector[i] - wallSignal_vector[1];		//+ve is an increase in wall sig
+			//ADD IF INCREASE SUBTRACT IF DECREASE
+			if (signal_diff>2){
+				tilt_sum++;
+			}else if (signal_diff<-2){
+				tilt_sum--;
 			}
-			cout<< "TILT SUM: "<<tilt_sum<<endl;
 
 
 
+			lastWallSignal =wallSignal_vector[WALL_SIGNAL_SAMPLES-1] ;
 			//ACTIONS FOR ANY OF THE EVENTS
-			if(lost_wall_count > 24){
-				cout<< "LOST WALL...ADJUSTING"<<endl;
-				//DRIVE FORWARD A LITTLE (250mm)
-				//this_thread::sleep_for(chrono::milliseconds(1850));
-				//robot_ptr->sendDriveCommand(0, Create::DRIVE_INPLACE_CLOCKWISE);
-				//this_thread::sleep_for(chrono::milliseconds(3000));
+			if(lost_wall_count > 3){
+				cout<< "LOST WALL...ADJUSTING:"<<endl;
+				// if (turn_vect.size()>0){
+				// 	if (turn_vect.back() == LEFT_TURN){
+						turn_vect.push_back(RIGHT_TURN);
+					//}
+				//}
 
-				if (robot_ptr->wallSignal() <2){
+				photos_taken =0;
+
+
+				//DRIVE FORWARD A LITTLE (250mm)
+				//robot_ptr->sendDriveCommand(0, Create::DRIVE_INPLACE_CLOCKWISE);
+				//robot_mutex.unlock();
+				//this_thread::sleep_for(chrono::milliseconds(100));
+				//robot_mutex.lock();
+				//robot_ptr->sendDriveCommand(FULLSPEED, Create::DRIVE_STRAIGHT);
+				robot_mutex.unlock();
+				//this_thread::sleep_for(chrono::milliseconds(770));
+				this_thread::sleep_for(chrono::milliseconds(720));
+				robot_mutex.lock();
+
+				if ( robot_ptr->wallSignal()<2){
 					//ROTATE 100 DEGREES CLOCKWISE
-					robot_ptr->sendDriveCommand(TURNSPEED, Create::DRIVE_INPLACE_CLOCKWISE);
+					//robot_ptr->sendDriveCommand(TURNSPEED, Create::DRIVE_INPLACE_CLOCKWISE);
+					//CURVE
+					robot_ptr->sendDriveDirectCommand( 250, 5);
+					robot_mutex.unlock();
+					//this_thread::sleep_for(chrono::milliseconds(1610));
 					this_thread::sleep_for(chrono::milliseconds(1610));
+					robot_mutex.lock();
 					//CONTINUE DRIVING STRAIGHT
+					//robot_ptr->sendDriveCommand(0, Create::DRIVE_INPLACE_CLOCKWISE);
 					robot_ptr->sendDriveCommand(FULLSPEED, Create::DRIVE_STRAIGHT);
 					// //CLEAR THE SAMPLES
 					wallSignal_vector.clear();
 					lost_wall_count =0;
 				}
 				else{
-					cout<< "FALSE ALARM"<<endl;
+					cout<< "**************	FALSE ALARM	**************"<<endl;
 					//CONTINUE DRIVING STRAIGHT
 					robot_ptr->sendDriveCommand(FULLSPEED, Create::DRIVE_STRAIGHT);
 				}
@@ -403,24 +524,62 @@ void* navigationThread(void* data){
 				cout<< " ADJUSTING TO THE LEFT "<<endl;
 				//ROTATE A FEW DEGREES COUNTERCLOCKWISE
 				//robot_ptr->sendDriveCommand(TURNSPEED, Create::DRIVE_INPLACE_COUNTERCLOCKWISE);
-				robot_ptr->sendDriveDirectCommand( 10, 250);
-				this_thread::sleep_for(chrono::milliseconds(115));
+
+				if (lastWallSignal >25){
+					robot_ptr->sendDriveDirectCommand( 10, 150);
+				}
+				else {
+					robot_ptr->sendDriveDirectCommand( 10, 100);
+				}
+
+				//robot_ptr->sendDriveDirectCommand( 10, 220);
+
+				robot_mutex.unlock();
+				//this_thread::sleep_for(chrono::milliseconds(185));
+				//this_thread::sleep_for(chrono::milliseconds(114));		//BEST
+				if (lastWallSignal > 25){
+					this_thread::sleep_for(chrono::milliseconds(160));
+				}
+				else{
+					this_thread::sleep_for(chrono::milliseconds(120));
+				}
+
+
+				robot_mutex.lock();
 				//CONTINUE DRIVING STRAIGHT
 				robot_ptr->sendDriveCommand(FULLSPEED, Create::DRIVE_STRAIGHT);
 				// //CLEAR THE SAMPLES
-				wallSignal_vector.clear();
+				//wallSignal_vector.clear();
 
 			}
 			else if (tilt_sum < 0){		//decreasing wall signal values
 				cout<< " ADJUSTING TO THE RIGHT "<<endl;
 				//ROTATE A FEW DEGREES CLOCKWISEA
 				//robot_ptr->sendDriveCommand(TURNSPEED, Create::DRIVE_INPLACE_CLOCKWISE);
-				robot_ptr->sendDriveDirectCommand( 250, 10);
-				this_thread::sleep_for(chrono::milliseconds(115));
+				//robot_ptr->sendDriveDirectCommand( 250, 10);
+				if (lastWallSignal < 5){
+					robot_ptr->sendDriveDirectCommand( 150, 10);
+				}
+				else{
+					robot_ptr->sendDriveDirectCommand( 100, 10);
+				}
+
+				robot_mutex.unlock();
+
+				//this_thread::sleep_for(chrono::milliseconds(170));
+				//this_thread::sleep_for(chrono::milliseconds(109));	//BEST
+				if (lastWallSignal < 5){
+					this_thread::sleep_for(chrono::milliseconds(150));
+				}
+				else {
+					this_thread::sleep_for(chrono::milliseconds(110));
+				}
+
+				robot_mutex.lock();
 				//CONTINUE DRIVING STRAIGHT
 				robot_ptr->sendDriveCommand(FULLSPEED, Create::DRIVE_STRAIGHT);
 				// //CLEAR THE SAMPLES
-				wallSignal_vector.clear();
+				//wallSignal_vector.clear();
 			}
 		}
 		robot_mutex.unlock();
@@ -438,6 +597,13 @@ void* navigationThread(void* data){
 			speed_mutex.lock();
 			speed_set=true;
 			speed_mutex.unlock();
+			photos_taken =0;	//reset photos taken
+
+			// if (turn_vect.size()>0){
+			// 	if (turn_vect.back() == RIGHT_TURN){
+					turn_vect.push_back(LEFT_TURN);
+			// 	}
+			// }
 
 		}
 
@@ -449,11 +615,12 @@ void* navigationThread(void* data){
 		//cout<< "NAVIGATION DIFF TIME: "<<time_diff_ms.count()<<endl;
 		//cout<< " NAVIGATION SLEEP TIME: "<<sleep_time_ms<<endl;
 		//Sleep to complete period
+		//cout<<"---------	LEAVING NAVIGATION	---------"<<endl;
 		if (sleep_time_ms > 0)
 			this_thread::sleep_for(chrono::milliseconds((long)sleep_time_ms));
 		else {
 			this_thread::sleep_for(chrono::milliseconds(PRIORITY_2_PERIOD));
-			cout<<"SPENT TOO LONG: "<<time_diff_ms.count()<<endl;
+			//cout<<"SPENT TOO LONG: "<<time_diff_ms.count()<<endl;
 		}
 
 	}
@@ -491,6 +658,12 @@ void wall_alignment (Create* robot_ptr){
 	robot_ptr->sendDriveCommand(TURNSPEED, Create::DRIVE_INPLACE_COUNTERCLOCKWISE);
 	//FIND THE LOCAL MAXIMA
 	while (1){
+		//check if finished
+		if (finished){
+			robot_mutex.unlock();
+			return;
+		}
+
 		//robot_mutex.lock();
 		//robot_ptr->sendDriveCommand(TURNSPEED, Create::DRIVE_INPLACE_COUNTERCLOCKWISE);
 
@@ -518,7 +691,7 @@ void wall_alignment (Create* robot_ptr){
 			//CHECK FOR A LOCAL MAXIMA
 			auto it = max_element(signal_vector.begin(), signal_vector.end());
 			//cout<< "MAX VALUE IS :" <<*it<<endl;
-			if ( (signal_vector[index] == *it)  && (signal_vector[index] > 10) && (signal_vector[index] > signal_vector[SWEEP_SAMPLE_SIZE-1]) ){
+			if ( (signal_vector[index] == *it)  && (signal_vector[index] > 5) && (signal_vector[index] > signal_vector[SWEEP_SAMPLE_SIZE-1]) ){
 			//if ( (signal_vector[index] > 40) ){
 				cout<< "GOING THE OTHER WAY"<<endl;
 				//robot_ptr->sendDriveCommand(0, Create::DRIVE_INPLACE_CLOCKWISE);
@@ -528,23 +701,24 @@ void wall_alignment (Create* robot_ptr){
 				//ROTATE BACK TO MAXIMA
 				robot_ptr->sendDriveCommand(TURNSPEED, Create::DRIVE_INPLACE_CLOCKWISE);
 				//robot_mutex.unlock();
-				this_thread::sleep_for(chrono::milliseconds(630));
+				this_thread::sleep_for(chrono::milliseconds(531));
 				//robot_mutex.lock();
 				//CONTINUE DRIVING STRAIGHT
 				robot_ptr->sendDriveCommand(FULLSPEED, Create::DRIVE_STRAIGHT);
 
-				cout<< "PRINTING ARRAY"<<endl;
-				for (size_t i =0; i<size; i++){
-					cout<< signal_vector[i]<<endl;
-				}
+				// cout<< "PRINTING ARRAY"<<endl;
+				// for (size_t i =0; i<size; i++){
+				// 	cout<< signal_vector[i]<<endl;
+				// }
 
 				robot_mutex.unlock();
 				//EXIT THE FUNCTION
 				break;
 			}
 		}
+		robot_mutex.unlock();
 		this_thread::sleep_for(chrono::milliseconds(10));
-		//robot_mutex.unlock();
+		robot_mutex.lock();
 	}
 }
 
@@ -871,7 +1045,7 @@ void* wallFollowThread(void* data){
 						//robot_mutex.lock();
 						//robot_ptr->sendDriveCommand(FULLSPEED, Create::DRIVE_STRAIGHT);
 						//wallSignal = robot_ptr->wallSignal();
-						cout<<"NEW WALL SIGNAL IS: "<<robot_ptr->wallSignal()<<endl;
+						//cout<<"NEW WALL SIGNAL IS: "<<robot_ptr->wallSignal()<<endl;
 						//ROTATE TO THE MAX TIME
 						robot_mutex.unlock();
 
@@ -1077,13 +1251,33 @@ void* objectIdentificationThread(void* data){
 
 	//FIND ALADIN
 	raspicam::RaspiCam_Cv Camera;
+	bool is_safe;
 
 	if (!Camera.open()) {
 		cerr << "Error opening the camera in thread" << endl;
 	}
 
+	//WAIT FOR FIRST BUMP
+	while (first){
+		this_thread::sleep_for(chrono::milliseconds(PRIORITY_3_PERIOD/5));
+	}
+
 	//WHILE THERE IS STILL SOMETHING TO FIND
-	while(   (data_str.queryImages_ptr->size() > 0 && safe_flag) && (!found_lamp)   ){
+	while(  data_str.queryImages_ptr->size() > 0  && (!found_lamp)   ){
+		if (finished){
+			pthread_exit(NULL);
+		}
+
+
+		safety_mutex.lock();
+		is_safe = safe_flag;
+		safety_mutex.unlock();
+		if (!is_safe || (photos_taken >= 2)){
+			cout<< "TOO MANY PHOTOS"<<endl;
+			this_thread::sleep_for(chrono::milliseconds(PRIORITY_3_PERIOD/5));
+			continue;
+		}
+		//cout<<"---------	IN OBJ IDENTIFICATION	---------"<<endl;
 		auto t_start = std::chrono::system_clock::now();
 		cv::Mat rgb_image, bgr_image;
 	    Camera.grab();
@@ -1091,23 +1285,37 @@ void* objectIdentificationThread(void* data){
 		Camera.retrieve(bgr_image);
 		cv::cvtColor(bgr_image, rgb_image, CV_RGB2BGR);
 		cv::imwrite("results/imageTaken.jpg", rgb_image);
-		 cout<<"...............TAKEN A PIC................."<<endl;
+		photos_taken ++;
+		cout<<"...............TAKEN A PIC................. NO:"<< photos_taken<< endl;
 		// this_thread::sleep_for(chrono::milliseconds(2500));
 		//queryImages = detect_object(queryImages, bgr_image, data_str);
 		image_vect.push_back(bgr_image);
 		*(data_str.queryImages_ptr) = detect_object(*(data_str.queryImages_ptr), bgr_image, data_str, &found_lamp);
 
-		cout<< "FOUND LAMP: "<<found_lamp<<endl;
+		//cout<< "FOUND LAMP: "<<found_lamp<<endl;
 		//FOUND THE LAMP:
 		if (found_lamp){
 			//TURN THE LIGHT ON & SHOW A RED LIGHT
-			//robot_ptr->sendLedCommand(Create::LED_NONE, Create::LED_COLOR_RED, Create::LED_INTENSITY_FULL);
+			cout<<"...............TURNING ON LIGHT ................."<<endl;
+			robot_mutex.lock();
+
+			robot_ptr->sendDriveCommand(0, Create::DRIVE_STRAIGHT);
+			robot_ptr->sendLedCommand(Create::LED_NONE, Create::LED_COLOR_RED, Create::LED_INTENSITY_FULL);
+			//robot_mutex.unlock();
 			//SLEEP FOR 2S
 			cout<<"...............FOUND LAMP ................."<<endl;
 			this_thread::sleep_for(chrono::milliseconds(2000));
 
 			found_lamp = true; ;
-			//robot_ptr->sendLedCommand(Create::LED_NONE, Create::LED_COLOR_RED, Create::LED_INTENSITY_OFF);
+			//robot_mutex.lock();
+			robot_ptr->sendLedCommand(Create::LED_NONE, Create::LED_COLOR_RED, Create::LED_INTENSITY_OFF);
+			robot_ptr->sendDriveCommand(FULLSPEED, Create::DRIVE_STRAIGHT);
+
+
+			robot_mutex.unlock();
+			if (finished){
+				pthread_exit(NULL);
+			}
 		}
 
 
@@ -1116,8 +1324,8 @@ void* objectIdentificationThread(void* data){
 		auto time_diff_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start);
 		sleep_time_ms = PRIORITY_3_PERIOD - time_diff_ms.count();
 
-
-		cout<<"............FINISHED DETECTING............."<<endl;
+		//cout<<"---------	LEAVING OBJ IDENTIFICATION	---------"<<endl;
+		//cout<<"............FINISHED DETECTING............."<<endl;
 		//Sleep to complete period
 		if (time_diff_ms.count() > 0)
 			this_thread::sleep_for(chrono::milliseconds((long)sleep_time_ms));
@@ -1129,17 +1337,26 @@ void* objectIdentificationThread(void* data){
 
 
 
-	cout<< "OUT OF LOOP "<<endl;
+	cout<< "<<<<<<<<<<<<<<<<<<<<<<<<<<<OUT OF LOOP: LAMP FOUND IS: "<< found_lamp<<endl;
 	//JUST KEEP TAKING PICS EVERY PERIOD
 	while (1){
 		auto t_start = std::chrono::system_clock::now();
 		cv::Mat rgb_image, bgr_image;
+		if (finished){
+			pthread_exit(NULL);
+		}
+
+		if (!is_safe || (photos_taken >= 2)){
+			this_thread::sleep_for(chrono::milliseconds(PRIORITY_3_PERIOD/5));
+			continue;
+		}
 
 		Camera.grab();
 		Camera.retrieve(bgr_image);
 		cv::cvtColor(bgr_image, rgb_image, CV_RGB2BGR);
 		image_vect.push_back(bgr_image);
-		cout<<"...............TAKEN A PIC OUT OF LOOP ................."<<endl;
+		photos_taken ++;
+		cout<<"...............TAKEN A PIC OUT OF LOOP................. NO:"<< photos_taken<< endl;
 		//SLEEP FOR REST OF PERIOD
 
 		cv::imwrite("results/imageTaken.jpg", rgb_image);
@@ -1158,12 +1375,45 @@ void* objectIdentificationThread(void* data){
 		else
 			this_thread::sleep_for(chrono::milliseconds(PRIORITY_3_PERIOD));
 
-		if (image_vect.size()>7)
+		if (finished){
 			pthread_exit(NULL);
+		}
 
 	}
 
 
+}
+
+
+
+
+//PROCESSES THE IMAGE VECTOR
+void* postProcessingThread(void * data){
+	//vector <cv::Mat> image_vect = &((vector <cv::Mat>*)data);
+	unsigned int cnt=0;
+	bool a;
+
+	objectInput data_str = *((objectInput*)(data));
+	vector <cv::Mat>my_vect = *(data_str.image_vect_ptr);
+
+	for (size_t i =0; i<my_vect.size(); i++){
+		cout<< "VECTOR SIZE: "<< my_vect.size()<<endl;
+		cv::Mat rgb_image;
+		cout <<"PIC NO: "<<i<<endl;
+		cv::cvtColor(my_vect[i], rgb_image, CV_RGB2BGR);
+		//cv::imwrite("results/imageTaken.jpg", rgb_image);
+		//cv::imwrite("results/vectImage.jpg", image_vect[i]);
+		a = false;
+		detect_object(*(data_str.queryImages_ptr), (*data_str.image_vect_ptr)[i], data_str, &a);
+		if (a){
+			cnt++;
+		}
+		//this_thread::sleep_for(chrono::milliseconds(5000));
+
+		if ((data_str.queryImages_ptr)->size() <=0)
+			break;
+	}
+	cout<< "FOUND: "<<cnt<<endl;
 }
 
 
@@ -1189,6 +1439,10 @@ int main ()
   char serial_loc[] = "/dev/ttyUSB0";
 
    try {
+   memset(&act, 0, sizeof(act));
+   act.sa_sigaction = sighandler;
+   act.sa_flags = SA_SIGINFO;
+   sigaction(SIGINT, &act, NULL);
     // raspicam::RaspiCam_Cv Camera;
     // cv::Mat rgb_image, bgr_image;
     // if (!Camera.open()) {
@@ -1196,35 +1450,35 @@ int main ()
     //   return -1;
     // }
     // cout << "Opened Camera" << endl;
-    // SerialStream stream (serial_loc, LibSerial::SerialStreamBuf::BAUD_57600);
-    // cout << "Opened Serial Stream to" << serial_loc << endl;
-    // this_thread::sleep_for(chrono::milliseconds(1000));
-    // Create robot(stream);
-    // cout << "Created iRobot Object" << endl;
-    // robot.sendFullCommand();
-    // cout << "Setting iRobot to Full Mode" << endl;
-    // this_thread::sleep_for(chrono::milliseconds(1000));
-    // cout << "Robot is ready" << endl;
-    //
-    //
-    // // Let's stream some sensors.
-    // Create::sensorPackets_t sensors;
-    // sensors.push_back(Create::SENSOR_BUMPS_WHEELS_DROPS);
-    // sensors.push_back(Create::SENSOR_WALL_SIGNAL);
-    // sensors.push_back (Create::SENSOR_BUTTONS);
-	// sensors.push_back (Create::SENSOR_CLIFF_LEFT_SIGNAL);
-	// sensors.push_back (Create::SENSOR_CLIFF_FRONT_LEFT_SIGNAL);
-	// sensors.push_back (Create::SENSOR_CLIFF_FRONT_RIGHT_SIGNAL);
-	// sensors.push_back (Create::SENSOR_CLIFF_RIGHT_SIGNAL);
-	// sensors.push_back (Create::SENSOR_OVERCURRENTS);
-    // robot.sendStreamCommand (sensors);
-    // cout << "Sent Stream Command" << endl;
-    //
-	// //Create songs
-    // Create:: note_t note(pair<unsigned char, unsigned char>(85, 8));
-	// Create:: song_t song;
-	// song.push_back(note);
-	// robot.sendSongCommand((unsigned char)0, song);
+    SerialStream stream (serial_loc, LibSerial::SerialStreamBuf::BAUD_57600);
+    cout << "Opened Serial Stream to" << serial_loc << endl;
+    this_thread::sleep_for(chrono::milliseconds(1000));
+    Create robot(stream);
+    cout << "Created iRobot Object" << endl;
+    robot.sendFullCommand();
+    cout << "Setting iRobot to Full Mode" << endl;
+    this_thread::sleep_for(chrono::milliseconds(1000));
+    cout << "Robot is ready" << endl;
+
+
+    // Let's stream some sensors.
+    Create::sensorPackets_t sensors;
+    sensors.push_back(Create::SENSOR_BUMPS_WHEELS_DROPS);
+    sensors.push_back(Create::SENSOR_WALL_SIGNAL);
+    sensors.push_back (Create::SENSOR_BUTTONS);
+	sensors.push_back (Create::SENSOR_CLIFF_LEFT_SIGNAL);
+	sensors.push_back (Create::SENSOR_CLIFF_FRONT_LEFT_SIGNAL);
+	sensors.push_back (Create::SENSOR_CLIFF_FRONT_RIGHT_SIGNAL);
+	sensors.push_back (Create::SENSOR_CLIFF_RIGHT_SIGNAL);
+	sensors.push_back (Create::SENSOR_OVERCURRENTS);
+    robot.sendStreamCommand (sensors);
+    cout << "Sent Stream Command" << endl;
+
+	//Create songs
+    Create:: note_t note(pair<unsigned char, unsigned char>(85, 8));
+	Create:: song_t song;
+	song.push_back(note);
+	robot.sendSongCommand((unsigned char)0, song);
 
 	//Create a few threads
 	pthread_t thread_ids[NUMTHREADS];
@@ -1280,7 +1534,7 @@ int main ()
 	object_input.keypoints_query_map_ptr = &keypoints_query_map;
 	object_input.descriptors_query_map_ptr = &descriptors_query_map;
 	object_input.queryImages_ptr = & queryImages;
-	//object_input.robot_ptr = &robot;
+	object_input.robot_ptr = &robot;
 
 
 
@@ -1313,19 +1567,43 @@ int main ()
 	pthread_attr_setschedparam(&attrVision, &paramVision);
 
 
+	// while (!robot.playButton()){
+	// 	fin
+	// }
+	// cout<< "FINISHED IS: "<<finished<<endl;
+
+
 
 	//CREATE THE THEADS
-	//pthread_create(&thread_ids[0], &attrSafety, safetyThread,(void*)&robot);
-	//pthread_create(&thread_ids[1], &attrMotion, navigationThread,(void*)&robot);
+	pthread_create(&thread_ids[0], &attrSafety, safetyThread,(void*)&robot);
+	pthread_create(&thread_ids[1], &attrMotion, navigationThread,(void*)&robot);
 	//pthread_create(&thread_ids[2], &attrMotion, mazePlotThread,(void*)&robot);
-	pthread_create(&thread_ids[1], &attrMotion, test, NULL );
-	pthread_create(&thread_ids[3], NULL, objectIdentificationThread,(void*)&object_input);
+	//pthread_create(&thread_ids[1], &attrMotion, test, NULL );
+	pthread_create(&thread_ids[3], &attrVision, objectIdentificationThread,(void*)&object_input);
 
 
 
 	//Waits for nav to finish
 	pthread_join(thread_ids[1], NULL);
+	robot.sendDriveCommand(0, Create::DRIVE_STRAIGHT);
+	if (safe_abort){
+		robot.sendLedCommand(Create::LED_NONE, Create::LED_COLOR_RED, Create::LED_INTENSITY_FULL);
+		cout<<"SAFE_ABORT"<<endl;
+		cout<<"PRINTING TURN VECTOR"<<endl;
+		for (size_t k =0; k<turn_vect.size(); k++){
+			cout<< turn_vect[k]<< " ";
+		}
+		cout<<endl;
+		exit(1);
+	}
+
+
 	cout<< ".....FINISHED NAV THREAD ......."<<endl;
+	pthread_join(thread_ids[3], NULL);
+	cout << "FINISHED VISION THREAD"<<endl;
+
+	//if (safe_abort)
+
 
 	queryImages.clear();
 
@@ -1340,7 +1618,7 @@ int main ()
 	queryImages["roman-glass-600"] = imread("object-identification/query-image/low-resolution/roman-glass-600.jpg", IMREAD_GRAYSCALE);
 	queryImages["willow-plate-600"] = imread("object-identification/query-image/low-resolution/willow-plate-600.jpg", IMREAD_GRAYSCALE);
 
-	for (iter = queryImages.begin(); iter != queryImages.end(); ++iter) {
+	for (iter = queryImages.begin(); iter != queryImages.end(); iter++) {
 		Mat img_query = iter->second;
 		detector->detectAndCompute(
 			img_query, Mat(), keypoints_query, descriptors_query);
@@ -1349,15 +1627,62 @@ int main ()
 		descriptors_query_map[iter->first] = descriptors_query;
 	}
 
-	// object_input.keypoints_query_map_ptr = &keypoints_query_map;
-	// object_input.descriptors_query_map_ptr = &descriptors_query_map;
-	// object_input.queryImages_ptr = & queryImages;
+
+
+
+	//split the vector int two size
+	vector<cv::Mat>  vector_b;
+	size_t size = image_vect.size();
+	for (size_t j =0; j< (size/2); j++){
+		vector_b.push_back((image_vect.back()).clone());
+		image_vect.pop_back();
+	}
+	cout<< "VECTOR SIZES ARE: "<<vector_b.size()<< " "<<image_vect.size()<<endl;
+
+
+
+	objectInput object_input_b;
+	object_input.keypoints_query_map_ptr = &keypoints_query_map;
+	object_input.descriptors_query_map_ptr = &descriptors_query_map;
+	object_input.queryImages_ptr = & queryImages;
+	object_input.robot_ptr = NULL;
+	object_input.image_vect_ptr = &image_vect;
+
+
+	object_input_b.keypoints_query_map_ptr = &keypoints_query_map;
+	object_input_b.descriptors_query_map_ptr = &descriptors_query_map;
+	object_input_b.queryImages_ptr = & queryImages;
+	object_input_b.robot_ptr = NULL;
+	object_input_b.image_vect_ptr = &vector_b;
+
+	//make two threads at the highest priority to do post processing
+	//input is a vector of images pointer
+	pthread_create(&thread_ids[0], &attrSafety, postProcessingThread,(void*)&object_input);
+	pthread_create(&thread_ids[1], &attrSafety, postProcessingThread,(void*)&object_input_b);
+
+	cout<<"PRINTING TURN VECTOR"<<endl;
+
+	for (size_t k =0; k<turn_vect.size(); k++){
+		cout<< turn_vect[k]<< " ";
+	}
+	cout<<endl;
+
+	cout<< "STARTING POST PROCESSING"<<endl;
+	//wait for both threads to finish
+	pthread_join (thread_ids[0], NULL);
+	pthread_join (thread_ids[1], NULL);
+	cout<< "FINISHED POST PROCESSING"<<endl;
+
+	exit (0);
+
+	while (1){}
 
 
 
 	bool a = false;
-	unsigned int cnt=0, size = queryImages.size();
-	cout<< "VECTOR SIZE: "<< image_vect.size()<<endl;
+	unsigned int cnt=0;
+	size = queryImages.size();
+	//cout<< "VECTOR SIZE: "<< image_vect.size()<<endl;
 
 
 	for (size_t i =0; i<image_vect.size(); i++){
@@ -1372,7 +1697,7 @@ int main ()
 		if (a){
 			cnt++;
 		}
-		this_thread::sleep_for(chrono::milliseconds(5000));
+		//this_thread::sleep_for(chrono::milliseconds(5000));
 
 		if (queryImages.size() <=0)
 			break;
@@ -1537,9 +1862,9 @@ map<string, Mat> detect_object(map<string, Mat> &img_querys, Mat &img_scene_full
 			auto sttime = steady_clock::now();
 			detector->detectAndCompute(
 				img_scene, Mat(), keypoints_scene, descriptors_scene);
-			cout << "Feature extraction scene image "
-				<< (duration <double>(steady_clock::now() - sttime)).count()
-				<< " sec" << endl;
+			// cout << "Feature extraction scene image "
+			// 	<< (duration <double>(steady_clock::now() - sttime)).count()
+			// 	<< " sec" << endl;
 			sttime = steady_clock::now();
 
 			cout << keypoints_query.size() << endl;
@@ -1567,9 +1892,9 @@ map<string, Mat> detect_object(map<string, Mat> &img_querys, Mat &img_scene_full
 				vector<Point2f> scene_corners(4);
 				bool res = alignPerspective(
 					query, scene, img_query, img_scene, scene_corners);
-				cout << "Matching and alignment "
-					<< (duration <double>(steady_clock::now() - sttime)).count()
-					<< " sec" << endl;
+				// cout << "Matching and alignment "
+				// 	<< (duration <double>(steady_clock::now() - sttime)).count()
+				// 	<< " sec" << endl;
 
 				// Write output to file
 				Mat img_matches;
@@ -1641,7 +1966,7 @@ bool alignPerspective(vector<Point2f>& query, vector<Point2f>& scene,
 	Mat& img_query, Mat& img_scene, vector<Point2f>& scene_corners) {
 	Mat H = findHomography(query, scene, RANSAC);
 	if (H.rows == 0 && H.cols == 0) {
-		cout << "Failed rule0: Empty homography" << endl;
+		// cout << "Failed rule0: Empty homography" << endl;
 		return false;
 	}
 
